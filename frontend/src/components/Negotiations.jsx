@@ -105,12 +105,13 @@ function ClauseCard({ clause }) {
 }
 
 export default function Negotiations({ navigate }) {
-  const [contracts,   setContracts]   = useState([])
-  const [selected,    setSelected]    = useState(null)  // contract id
-  const [result,      setResult]      = useState(null)  // { cached, stale, created_at, analysis }
-  const [loading,     setLoading]     = useState(false)
-  const [loadingData, setLoadingData] = useState(true)
-  const [error,       setError]       = useState(null)
+  const [contracts,    setContracts]    = useState([])
+  const [selected,     setSelected]     = useState(null)
+  const [result,       setResult]       = useState(null)
+  const [loading,      setLoading]      = useState(false)
+  const [loadingData,  setLoadingData]  = useState(true)
+  const [error,        setError]        = useState(null)
+  const [streamStatus, setStreamStatus] = useState(null)
 
   useEffect(() => {
     api.getContracts()
@@ -137,13 +138,41 @@ export default function Negotiations({ navigate }) {
     if (!selected || loading) return
     setLoading(true)
     setError(null)
+    setStreamStatus('Connecting…')
     try {
-      const r = await api.analyzeNegotiation(selected)
-      setResult(r)
+      const token = localStorage.getItem('clause_token')
+      const res = await fetch(`/api/negotiations/${selected}/analyze`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`
+        try { const d = await res.json(); msg = d.detail || msg } catch {}
+        throw new Error(msg)
+      }
+      const reader  = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let chars  = 0
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = JSON.parse(line.slice(6))
+          if (data.error) throw new Error(data.error)
+          if (data.t) { chars += data.t.length; setStreamStatus(`Analysing… ${chars} chars`) }
+          if (data.done) { setResult(data); setStreamStatus(null) }
+        }
+      }
     } catch (e) {
       setError(e.message)
     } finally {
       setLoading(false)
+      setStreamStatus(null)
     }
   }
 
@@ -201,7 +230,7 @@ export default function Negotiations({ navigate }) {
             style={{ minWidth: 160 }}
           >
             {loading
-              ? <><span className="loading-spin" style={{ width: 12, height: 12, marginRight: 6 }} />Analysing…</>
+              ? <><span className="loading-spin" style={{ width: 12, height: 12, marginRight: 6 }} />{streamStatus || 'Analysing…'}</>
               : result ? '🔄 Refresh Analysis' : '🤝 Run Analysis'}
           </button>
           {result && (

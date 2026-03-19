@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,
     Float, Text, DateTime, ForeignKey, text,
@@ -384,7 +384,27 @@ def compute_portfolio_hash(db: Session, exclude_id: int) -> str:
     return hashlib.md5("|".join(parts).encode()).hexdigest()
 
 
-def search_with_claude(question: str, contracts: list) -> dict:
+# Role-aware context injected into every LLM call that surfaces results to a user
+ROLE_CONTEXT = {
+    "legal": (
+        "Legal Counsel — primary focus: risk exposure, problematic clause language, and legal liability. "
+        "Give clause-level detail, cite exact section references, flag anything that could become a liability. "
+        "Prioritise precision over brevity."
+    ),
+    "procurement": (
+        "Procurement/Operations Manager — primary focus: upcoming renewals, vendor obligations, spend optimisation, "
+        "and leverage for renegotiation. Lead with deadlines, action items, and contract value. "
+        "Be concrete and action-oriented."
+    ),
+    "executive": (
+        "Executive (CFO/COO) — primary focus: strategic overview, total financial commitments, concentration risk, "
+        "and compliance posture. Summarise at the portfolio level with key numbers. "
+        "Skip clause-level detail unless it has material financial or strategic impact."
+    ),
+}
+
+
+def search_with_claude(question: str, contracts: list, role: str = None) -> dict:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set in environment")
@@ -411,17 +431,27 @@ def search_with_claude(question: str, contracts: list) -> dict:
         )
 
     context = "\n\n---\n\n".join(context_parts)
+
+    role_instruction = ""
+    if role and role in ROLE_CONTEXT:
+        role_instruction = (
+            f"You are speaking with a {ROLE_CONTEXT[role]}\n"
+            "Adjust the depth, focus, and format of your answer to match their perspective.\n\n"
+        )
+
     prompt = (
-        "You are a contract intelligence assistant. Answer the user's question based ONLY on the contract data below. "
+        "You are a contract intelligence assistant. "
+        + role_instruction +
+        "Answer the user's question based ONLY on the contract data below. "
         "Be specific — cite contract names and exact clause section references. "
         "Each result must include the contract_id (the integer N from 'Contract #N' in the data below). "
         "Return ONLY valid JSON, no markdown:\n"
         "{\n"
-        '  "answer": "2-3 sentence narrative answer",\n'
+        '  "answer": "2-3 sentence narrative answer tailored to the user\'s role",\n'
         '  "results": [\n'
         '    {"contract_id": <integer N from Contract #N>, "contract_name": "name", "relevant_value": "specific value or clause text", "section_ref": "§ X.Y — Section Name or empty string", "severity": "critical|high|medium|low|info"}\n'
         "  ],\n"
-        '  "recommendation": "One clear actionable recommendation, or null"\n'
+        '  "recommendation": "One clear actionable recommendation suited to the user\'s role, or null"\n'
         "}\n\n"
         f"Contracts:\n{context}\n\n"
         f"Question: {question}"
@@ -436,21 +466,16 @@ def search_with_claude(question: str, contracts: list) -> dict:
     return parse_claude_json(msg.content[0].text)
 
 
-def analyze_for_negotiations(target: dict, portfolio: list) -> dict:
-    """Compare target contract clauses against the rest of the portfolio."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not set")
-
+def build_negotiations_prompt(target: dict, portfolio: list, role: str = None) -> str:
+    """Build the negotiations analysis prompt — concise output to minimise token count."""
     def fmt_val(v):
         if not v: return "N/A"
         if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
         if v >= 1_000: return f"${int(v/1000)}k"
         return f"${int(v)}"
 
-    # Build target summary
     target_clauses = "\n".join(
-        f"  - [{r['severity'].upper()}] {r['type']}: {r['title']} — {r['description']} ({r['section_ref'] or 'no ref'})"
+        f"  - [{r['severity'].upper()}] {r['type']}: {r['title']} — {r['description'][:120]} ({r['section_ref'] or 'no ref'})"
         for r in target.get("risk_clauses", [])
     )
     target_block = (
@@ -462,35 +487,38 @@ def analyze_for_negotiations(target: dict, portfolio: list) -> dict:
         f"Clauses:\n{target_clauses or '  None identified'}"
     )
 
-    # Build portfolio summary
     portfolio_parts = []
     for c in portfolio:
         clauses = "\n".join(
-            f"    - {r['type']}: {r['title']} — {r['description'][:200]}"
+            f"    - {r['type']}: {r['title']} — {r['description'][:80]}"
             for r in c.get("risk_clauses", [])
         )
         portfolio_parts.append(
-            f"  Contract: {c['name']} (Type: {c['contract_type']}, Value: {fmt_val(c.get('total_value'))})\n"
-            f"  Auto-renewal: {'Yes, ' + str(c['auto_renewal_notice_days']) + 'd' if c.get('auto_renewal') else 'No'} | "
-            f"Governing law: {c.get('governing_law','N/A')}\n"
-            f"  Clauses:\n{clauses or '    None'}"
+            f"  {c['name']} ({c['contract_type']}, {fmt_val(c.get('total_value'))}) | "
+            f"Auto-renewal: {'Yes ' + str(c['auto_renewal_notice_days']) + 'd' if c.get('auto_renewal') else 'No'} | "
+            f"Law: {c.get('governing_law','N/A')}\n"
+            f"{clauses or '    None'}"
         )
-    portfolio_block = "PORTFOLIO CONTRACTS (for benchmarking):\n" + "\n\n".join(portfolio_parts)
+    portfolio_block = "PORTFOLIO:\n" + "\n\n".join(portfolio_parts)
 
-    prompt = f"""You are a contract negotiation intelligence assistant for a legal/procurement team.
+    role_instruction = ""
+    if role and role in ROLE_CONTEXT:
+        role_instruction = f"You are assisting a {ROLE_CONTEXT[role]}\nTailor the depth, emphasis, and recommended actions in your analysis accordingly.\n\n"
 
-Analyse the TARGET CONTRACT and compare each of its key clauses against the PORTFOLIO CONTRACTS.
+    return f"""You are a contract negotiation intelligence assistant.
+
+{role_instruction}Analyse the TARGET CONTRACT and compare each of its key clauses against the PORTFOLIO CONTRACTS.
 For each clause type, identify whether the target's terms are unfavourable, average, or favourable compared to the portfolio, and generate a specific negotiation talking point that cites real portfolio data.
 
 Return ONLY valid JSON (no markdown, no code fences):
 {{
-  "overall_position": "2-3 sentence summary of negotiation position and key risks",
+  "overall_position": "2-3 sentence summary of the overall negotiation position and key risks",
   "leverage_score": <integer 1-5, where 5 = strong leverage / many unfavourable terms to push back on>,
   "clauses": [
     {{
       "type": "<clause type string>",
       "label": "<human-readable label>",
-      "your_position": "<what this contract says, concisely>",
+      "your_position": "<what this contract says>",
       "portfolio_benchmark": "<what comparable portfolio contracts say, with specifics e.g. 'avg $380k across 3 SaaS contracts'>",
       "benchmark_rating": "below_average | average | above_average | no_data",
       "talking_point": "<specific negotiation talking point citing portfolio data, 1-2 sentences>",
@@ -509,14 +537,6 @@ Return ONLY valid JSON (no markdown, no code fences):
 
 Analyse every clause in the target contract. For clause types not present in the portfolio, still analyse the target's position in absolute terms and note the absence of benchmarks. Be specific — cite actual values and contract names from the portfolio.
 """
-
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return parse_claude_json(msg.content[0].text)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -743,6 +763,7 @@ def get_contract_pdf(contract_id: int, db: Session = Depends(get_db)):
 class SearchRequest(BaseModel):
     question: str
     contract_id: Optional[int] = None
+    role: Optional[str] = None   # "legal" | "procurement" | "executive"
 
 
 @app.post("/api/search")
@@ -755,7 +776,7 @@ def search_contracts(req: SearchRequest, db: Session = Depends(get_db)):
         return {"answer": "No contracts found in the system.", "results": [], "recommendation": None}
     contract_dicts = [contract_to_dict(c) for c in contracts]
     try:
-        return search_with_claude(req.question, contract_dicts)
+        return search_with_claude(req.question, contract_dicts, role=req.role)
     except Exception as e:
         raise HTTPException(500, f"Search failed: {e}")
 
@@ -780,8 +801,8 @@ def get_negotiation(contract_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/negotiations/{contract_id}/analyze")
-def run_negotiation_analysis(contract_id: int, db: Session = Depends(get_db)):
-    """Run (or re-run) negotiation analysis for the given contract."""
+def run_negotiation_analysis(contract_id: int, role: Optional[str] = None, db: Session = Depends(get_db)):
+    """Run negotiation analysis, streaming tokens to the client via SSE."""
     target = db.query(Contract).filter(Contract.id == contract_id, Contract.status == "completed").first()
     if not target:
         raise HTTPException(404, "Contract not found or not yet processed")
@@ -792,26 +813,49 @@ def run_negotiation_analysis(contract_id: int, db: Session = Depends(get_db)):
     if not portfolio:
         raise HTTPException(400, "Need at least one other contract in portfolio to benchmark against")
 
-    target_dict    = contract_to_dict(target)
-    portfolio_dicts = [contract_to_dict(c) for c in portfolio]
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(500, "ANTHROPIC_API_KEY not set")
 
-    try:
-        analysis = analyze_for_negotiations(target_dict, portfolio_dicts)
-    except Exception as e:
-        raise HTTPException(500, f"Analysis failed: {e}")
+    prompt   = build_negotiations_prompt(contract_to_dict(target), [contract_to_dict(c) for c in portfolio], role=role)
+    ph       = compute_portfolio_hash(db, exclude_id=contract_id)
+    ai       = anthropic.Anthropic(api_key=api_key)
 
-    ph = compute_portfolio_hash(db, exclude_id=contract_id)
+    def generate():
+        full_text = ""
+        try:
+            with ai.messages.stream(
+                model="claude-sonnet-4-6",
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                for chunk in stream.text_stream:
+                    full_text += chunk
+                    yield f"data: {json.dumps({'t': chunk})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            return
 
-    existing = db.query(NegotiationAnalysis).filter(NegotiationAnalysis.contract_id == contract_id).first()
-    if existing:
-        existing.analysis       = analysis
-        existing.portfolio_hash = ph
-        existing.created_at     = datetime.utcnow()
-    else:
-        db.add(NegotiationAnalysis(contract_id=contract_id, analysis=analysis, portfolio_hash=ph))
-    db.commit()
+        try:
+            analysis = parse_claude_json(full_text)
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'Parse failed: {e}'})}\n\n"
+            return
 
-    return {"cached": True, "stale": False, "created_at": datetime.utcnow().isoformat(), "analysis": analysis}
+        existing = db.query(NegotiationAnalysis).filter(NegotiationAnalysis.contract_id == contract_id).first()
+        now = datetime.utcnow()
+        if existing:
+            existing.analysis       = analysis
+            existing.portfolio_hash = ph
+            existing.created_at     = now
+        else:
+            db.add(NegotiationAnalysis(contract_id=contract_id, analysis=analysis, portfolio_hash=ph))
+        db.commit()
+
+        yield f"data: {json.dumps({'done': True, 'cached': True, 'stale': False, 'created_at': now.isoformat(), 'analysis': analysis})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.delete("/api/contracts/{contract_id}")

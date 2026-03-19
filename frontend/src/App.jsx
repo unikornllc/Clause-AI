@@ -110,6 +110,7 @@ export default function App() {
   }, [user])
 
   function handleLogin(userData) {
+    localStorage.setItem('clause_user', JSON.stringify(userData))
     setUser(userData)
     // Apply hash if present, otherwise go to role home
     const { view: v, id, clauseType } = parseHash(window.location.hash)
@@ -125,6 +126,7 @@ export default function App() {
   function handleLogout() {
     api.logout().catch(() => {})
     localStorage.removeItem('clause_token')
+    localStorage.removeItem('clause_user')
     setUser(null)
     setContractId(null)
     setFocusClause(null)

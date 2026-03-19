@@ -4,6 +4,10 @@ function getToken() {
   return localStorage.getItem('clause_token')
 }
 
+function getRole() {
+  try { return JSON.parse(localStorage.getItem('clause_user') || '{}').role || null } catch { return null }
+}
+
 async function request(method, path, body) {
   const opts = { method, headers: {} }
   const token = getToken()
@@ -33,11 +37,11 @@ export const api = {
   getContracts:       ()                    => request('GET',    '/api/contracts'),
   getContract:        (id)                  => request('GET',    `/api/contracts/${id}`),
   uploadContract:     (formData)            => request('POST',   '/api/contracts/upload', formData),
-  search:             (question, contractId) => request('POST',  '/api/search', { question, contract_id: contractId ?? null }),
+  search:             (question, contractId) => request('POST',  '/api/search', { question, contract_id: contractId ?? null, role: getRole() }),
   deleteContract:     (id)                  => request('DELETE', `/api/contracts/${id}`),
   getObligations:     ()                    => request('GET',    '/api/obligations'),
   completeObligation: (id)                  => request('PUT',    `/api/obligations/${id}/complete`),
   getStats:           ()                    => request('GET',    '/api/stats'),
   getNegotiation:     (id) => request('GET',  `/api/negotiations/${id}`),
-  analyzeNegotiation: (id) => request('POST', `/api/negotiations/${id}/analyze`),
+  analyzeNegotiation: (id) => request('POST', `/api/negotiations/${id}/analyze?role=${getRole() || ''}`),
 }
