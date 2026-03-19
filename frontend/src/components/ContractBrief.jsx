@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { api } from '../api'
+import PdfViewer from './PdfViewer'
 
 function fmt(v, cur) {
   if (v == null) return '—'
@@ -21,7 +22,6 @@ function daysUntil(s) {
 // Render plain_english_summary with **bold** markdown
 function Summary({ text }) {
   if (!text) return null
-  const parts = text.split(/(\*\*[^*]+\*\*)/g)
   const paras = text.split('\n\n').filter(Boolean)
   return (
     <>
@@ -41,10 +41,11 @@ function Summary({ text }) {
   )
 }
 
-export default function ContractBrief({ contractId, navigate }) {
-  const [contract, setContract] = useState(null)
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState(null)
+export default function ContractBrief({ contractId, navigate, focusClause }) {
+  const [contract,     setContract]     = useState(null)
+  const [loading,      setLoading]      = useState(true)
+  const [error,        setError]        = useState(null)
+  const [activeItem,   setActiveItem]   = useState(null)   // { page_number, text_snippet, id, kind }
 
   useEffect(() => {
     if (!contractId) { setLoading(false); return }
@@ -54,6 +55,22 @@ export default function ContractBrief({ contractId, navigate }) {
       .finally(() => setLoading(false))
   }, [contractId])
 
+  // Reset active item when contract changes
+  useEffect(() => { setActiveItem(null) }, [contractId])
+
+  // When a focusClause is provided (navigated from Risk Map drill-down),
+  // highlight the matching risk clause and scroll to it
+  useEffect(() => {
+    if (!contract || !focusClause) return
+    const match = contract.risk_clauses?.find(r => r.type === focusClause)
+    if (!match) return
+    setActiveItem({ ...match, kind: 'risk' })
+    setTimeout(() => {
+      document.getElementById(`risk-clause-${focusClause}`)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }, 120)
+  }, [contract, focusClause])
+
   async function handleDelete() {
     if (!window.confirm(`Delete "${contract?.name}"? This cannot be undone.`)) return
     try {
@@ -62,6 +79,11 @@ export default function ContractBrief({ contractId, navigate }) {
     } catch (e) {
       alert('Delete failed: ' + e.message)
     }
+  }
+
+  function handleItemClick(item, kind) {
+    const isSame = activeItem?.id === item.id && activeItem?.kind === kind
+    setActiveItem(isSame ? null : { ...item, kind })
   }
 
   if (!contractId) return (
@@ -84,6 +106,8 @@ export default function ContractBrief({ contractId, navigate }) {
     ? new Date(new Date(contract.expiration_date) - contract.auto_renewal_notice_days * 86400000)
         .toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
     : null
+
+  const hasPdf = contract.has_pdf
 
   return (
     <div className="content">
@@ -122,9 +146,11 @@ export default function ContractBrief({ contractId, navigate }) {
         </div>
       </div>
 
-      <div className="two-col">
+      {/* Main body — three columns when PDF exists, two otherwise */}
+      <div className={hasPdf ? 'three-col' : 'two-col'}>
+
+        {/* LEFT — Summary + Key Details */}
         <div>
-          {/* Plain English Summary — the clever part */}
           <div style={{ marginBottom: 18 }}>
             <div className="section-title" style={{ marginBottom: 10 }}>What you actually agreed to</div>
             <div className="plain-english">
@@ -132,7 +158,6 @@ export default function ContractBrief({ contractId, navigate }) {
             </div>
           </div>
 
-          {/* Key details grid */}
           <div className="section-title" style={{ marginBottom: 10 }}>Key Details</div>
           <div className="detail-grid">
             <div className="detail-item">
@@ -172,32 +197,69 @@ export default function ContractBrief({ contractId, navigate }) {
           </div>
         </div>
 
-        {/* Risk flags */}
+        {/* MIDDLE — PDF Viewer (only when PDF exists) */}
+        {hasPdf && (
+          <div className="pdf-panel">
+            <div className="section-title" style={{ marginBottom: 10 }}>
+              Contract Document
+              {activeItem?.section_ref && (
+                <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: 'var(--text-3)' }}>
+                  · {activeItem.section_ref}
+                </span>
+              )}
+            </div>
+            <PdfViewer
+              contractId={contractId}
+              sectionRef={activeItem?.section_ref || null}
+              fallbackPage={activeItem?.page_number || 1}
+            />
+          </div>
+        )}
+
+        {/* RIGHT — Risk Flags + Obligations */}
         <div>
           <div className="section-title" style={{ marginBottom: 10 }}>
             Risk Flags
             <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-3)', fontWeight: 400 }}>
               ({contract.risk_clauses?.length || 0} found)
             </span>
+            {hasPdf && (
+              <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-3)', fontWeight: 400 }}>
+                · click to view in PDF
+              </span>
+            )}
           </div>
           {contract.risk_clauses?.length > 0 ? (
             <div className="risk-list">
-              {contract.risk_clauses.map(r => (
-                <div key={r.id} className={`risk-item ${r.severity}`}>
-                  <div className={`risk-dot ${r.severity}`} />
-                  <div>
-                    <div className="risk-text-title">{r.title}</div>
-                    <div className="risk-text-desc">{r.description}</div>
-                    {r.section_ref && <div className="risk-text-clause">{r.section_ref}</div>}
+              {contract.risk_clauses.map(r => {
+                const isActive = activeItem?.id === r.id && activeItem?.kind === 'risk'
+                return (
+                  <div
+                    key={r.id}
+                    id={`risk-clause-${r.type}`}
+                    className={`risk-item ${r.severity}${isActive ? ' risk-item-active' : ''}${hasPdf && r.page_number ? ' risk-item-clickable' : ''}`}
+                    onClick={() => hasPdf && r.page_number && handleItemClick(r, 'risk')}
+                  >
+                    <div className={`risk-dot ${r.severity}`} />
+                    <div style={{ flex: 1 }}>
+                      <div className="risk-text-title">
+                        {r.title}
+                        {hasPdf && r.page_number && (
+                          <span className="risk-page-badge">p.{r.page_number}</span>
+                        )}
+                      </div>
+                      <div className="risk-text-desc">{r.description}</div>
+                      {r.section_ref && <div className="risk-text-clause">{r.section_ref}</div>}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           ) : (
             <div style={{ color: 'var(--text-3)', fontSize: 13 }}>No risk clauses flagged.</div>
           )}
 
-          {/* Obligations teaser */}
+          {/* Obligations */}
           {contract.obligations?.length > 0 && (
             <div style={{ marginTop: 18 }}>
               <div className="section-title" style={{ marginBottom: 10 }}>
@@ -205,16 +267,28 @@ export default function ContractBrief({ contractId, navigate }) {
                 <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-3)', fontWeight: 400 }}>
                   ({contract.obligations.length})
                 </span>
+                {hasPdf && (
+                  <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-3)', fontWeight: 400 }}>
+                    · click to view in PDF
+                  </span>
+                )}
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
                 {contract.obligations.map(o => {
-                  const d = daysUntil(o.due_date)
+                  const isActive = activeItem?.id === o.id && activeItem?.kind === 'obligation'
                   return (
-                    <div key={o.id} style={{ background: 'var(--bg-raised)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 13px' }}>
+                    <div
+                      key={o.id}
+                      className={`obligation-item${isActive ? ' obligation-item-active' : ''}${hasPdf && o.page_number ? ' risk-item-clickable' : ''}`}
+                      onClick={() => hasPdf && o.page_number && handleItemClick(o, 'obligation')}
+                    >
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <span style={{ fontSize: 12, fontWeight: 600, flex: 1 }}>{o.title}</span>
-                        {o.status === 'overdue' && <span className="risk-pill critical" style={{ fontSize: 10 }}>overdue</span>}
-                        {o.status === 'completed' && <span className="risk-pill low" style={{ fontSize: 10 }}>done</span>}
+                        {hasPdf && o.page_number && (
+                          <span className="risk-page-badge">p.{o.page_number}</span>
+                        )}
+                        {o.status === 'overdue'   && <span className="risk-pill critical" style={{ fontSize: 10 }}>overdue</span>}
+                        {o.status === 'completed' && <span className="risk-pill low"      style={{ fontSize: 10 }}>done</span>}
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 3, fontFamily: 'JetBrains Mono, monospace' }}>
                         {o.trigger_type === 'event_based' ? '⚡ Event-based' : o.due_date ? `Due ${fmtDate(o.due_date)}` : '—'}
@@ -223,6 +297,17 @@ export default function ContractBrief({ contractId, navigate }) {
                     </div>
                   )
                 })}
+              </div>
+            </div>
+          )}
+
+          {/* No PDF notice for seed contracts */}
+          {!hasPdf && (
+            <div className="pdf-no-file">
+              <div className="pdf-no-file-icon">📄</div>
+              <div>No PDF on file</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
+                Upload a contract PDF to see it here with mapped insights
               </div>
             </div>
           )}

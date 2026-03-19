@@ -1,8 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,
-    Float, Text, DateTime, ForeignKey,
+    Float, Text, DateTime, ForeignKey, text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.types import JSON as SAJson
@@ -15,6 +16,8 @@ import pdfplumber
 import json
 import os
 import io
+import hashlib
+import secrets
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -61,6 +64,7 @@ class Contract(Base):
     currency                 = Column(String, default="USD")
     governing_law            = Column(String)
     plain_english_summary    = Column(Text)
+    pdf_path                 = Column(String)   # path to stored PDF file
     created_at               = Column(DateTime, default=datetime.utcnow)
     risk_clauses  = relationship("RiskClause",  back_populates="contract", cascade="all, delete-orphan")
     obligations   = relationship("Obligation",  back_populates="contract", cascade="all, delete-orphan")
@@ -68,14 +72,16 @@ class Contract(Base):
 
 class RiskClause(Base):
     __tablename__ = "risk_clauses"
-    id          = Column(Integer, primary_key=True)
-    contract_id = Column(Integer, ForeignKey("contracts.id"))
-    type        = Column(String)
-    severity    = Column(String)
-    title       = Column(String)
-    description = Column(Text)
-    section_ref = Column(String)
-    contract    = relationship("Contract", back_populates="risk_clauses")
+    id           = Column(Integer, primary_key=True)
+    contract_id  = Column(Integer, ForeignKey("contracts.id"))
+    type         = Column(String)
+    severity     = Column(String)
+    title        = Column(String)
+    description  = Column(Text)
+    section_ref  = Column(String)
+    page_number  = Column(Integer)   # PDF page where this clause appears
+    text_snippet = Column(Text)      # exact quoted text from the contract
+    contract     = relationship("Contract", back_populates="risk_clauses")
 
 
 class Obligation(Base):
@@ -89,16 +95,102 @@ class Obligation(Base):
     owner_team   = Column(String)
     trigger_type = Column(String, default="time_based")
     status       = Column(String, default="pending")
+    section_ref  = Column(String)    # e.g. "§ 5.2 — Reporting Obligations"
+    page_number  = Column(Integer)   # PDF page where this obligation appears
+    text_snippet = Column(Text)      # exact quoted text from the contract
     contract     = relationship("Contract", back_populates="obligations")
+
+
+class User(Base):
+    __tablename__ = "users"
+    id            = Column(Integer, primary_key=True)
+    username      = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role          = Column(String, nullable=False)   # legal | procurement | executive
+    full_name     = Column(String, nullable=False)
+    sessions      = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    id         = Column(Integer, primary_key=True)
+    token      = Column(String, unique=True, nullable=False)
+    user_id    = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user       = relationship("User", back_populates="sessions")
 
 
 Base.metadata.create_all(bind=engine)
 
 
 # ─────────────────────────────────────────────────────────────
+# Auth helpers
+# ─────────────────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    key  = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260000)
+    return f"{salt}:{key.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, key_hex = stored_hash.split(":", 1)
+        key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260000)
+        return secrets.compare_digest(key.hex(), key_hex)
+    except Exception:
+        return False
+
+
+def get_current_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)) -> User:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Not authenticated")
+    token = authorization[7:]
+    session = db.query(UserSession).filter(UserSession.token == token).first()
+    if not session:
+        raise HTTPException(401, "Invalid or expired session")
+    return session.user
+
+
+def run_migrations():
+    """Add new columns to existing tables without dropping data."""
+    with engine.connect() as conn:
+        for table, column, dtype in [
+            ("contracts",    "pdf_path",    "TEXT"),
+            ("risk_clauses", "page_number", "INTEGER"),
+            ("risk_clauses", "text_snippet","TEXT"),
+            ("obligations",  "section_ref", "TEXT"),
+            ("obligations",  "page_number", "INTEGER"),
+            ("obligations",  "text_snippet","TEXT"),
+        ]:
+            try:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {dtype}"))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+
+def seed_users(db: Session):
+    """Create three demo users if they don't already exist."""
+    demo_users = [
+        ("sarah.chen",    "legal123",       "legal",       "Sarah Chen"),
+        ("marcus.webb",   "procurement123", "procurement", "Marcus Webb"),
+        ("jennifer.park", "coo123",         "executive",   "Jennifer Park"),
+    ]
+    for username, password, role, full_name in demo_users:
+        if not db.query(User).filter(User.username == username).first():
+            db.add(User(
+                username=username,
+                password_hash=hash_password(password),
+                role=role,
+                full_name=full_name,
+            ))
+    db.commit()
+
+
+# ─────────────────────────────────────────────────────────────
 # AI Extraction
 # ─────────────────────────────────────────────────────────────
-EXTRACTION_PROMPT = """You are a contract analysis AI. Extract information from this contract and return ONLY valid JSON — no markdown, no code fences, no extra text.
+EXTRACTION_PROMPT = """You are a contract analysis AI. The contract text below has [PAGE N] markers indicating page breaks. Extract information and return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this structure:
 {
@@ -119,7 +211,9 @@ Return exactly this structure:
       "severity": "critical" | "high" | "medium" | "low",
       "title": "Short descriptive title (6 words max)",
       "description": "1-2 sentences explaining the risk in plain English",
-      "section_ref": "§ X.Y — Section Name"
+      "section_ref": "§ X.Y — Section Name",
+      "page_number": <integer page number from [PAGE N] marker where this clause appears, or 1 if unknown>,
+      "text_snippet": "<exact quoted phrase of 15-25 words from the contract text that contains this clause>"
     }
   ],
   "obligations": [
@@ -129,7 +223,10 @@ Return exactly this structure:
       "due_date": "YYYY-MM-DD or null",
       "frequency": "one_time" | "monthly" | "quarterly" | "annual" | "event_based",
       "owner_team": "Legal" | "Finance" | "IT" | "Procurement" | "Operations" | "HR",
-      "trigger_type": "time_based" | "event_based"
+      "trigger_type": "time_based" | "event_based",
+      "section_ref": "§ X.Y — Section Name (the contract section that creates this obligation)",
+      "page_number": <integer page number from [PAGE N] marker where this obligation appears, or 1 if unknown>,
+      "text_snippet": "<exact quoted phrase of 15-25 words from the contract text that creates this obligation>"
     }
   ]
 }
@@ -141,6 +238,8 @@ Contract text:
 def parse_claude_json(text: str) -> dict:
     """Robustly parse JSON from Claude output, stripping markdown fences if present."""
     text = text.strip()
+    if not text:
+        raise ValueError("Empty response from Claude — the prompt may have exceeded max_tokens")
     if "```" in text:
         for block in text.split("```"):
             block = block.strip()
@@ -150,10 +249,28 @@ def parse_claude_json(text: str) -> dict:
                 return json.loads(block)
             except json.JSONDecodeError:
                 continue
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Last resort: extract the first {...} block in case of leading/trailing prose
+        import re
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        raise
 
 
-def extract_with_claude(text: str) -> dict:
+def extract_text_with_pages(contents: bytes) -> str:
+    """Extract text from PDF with [PAGE N] markers for each page."""
+    with pdfplumber.open(io.BytesIO(contents)) as pdf:
+        parts = []
+        for i, page in enumerate(pdf.pages, 1):
+            page_text = page.extract_text() or ""
+            parts.append(f"[PAGE {i}]\n{page_text}")
+        return "\n\n".join(parts)
+
+
+def extract_with_claude(tagged_text: str) -> dict:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set in environment")
@@ -161,7 +278,7 @@ def extract_with_claude(text: str) -> dict:
     msg = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
-        messages=[{"role": "user", "content": EXTRACTION_PROMPT + text[:50000]}],
+        messages=[{"role": "user", "content": EXTRACTION_PROMPT + tagged_text[:50000]}],
     )
     return parse_claude_json(msg.content[0].text)
 
@@ -173,29 +290,35 @@ def search_with_claude(question: str, contracts: list) -> dict:
 
     context_parts = []
     for c in contracts:
-        risk_summary = json.dumps([
-            {"title": r["title"], "severity": r["severity"], "type": r["type"], "section": r["section_ref"]}
+        risk_lines = "\n".join(
+            f"  - [{r['severity'].upper()}] {r['title']} ({r['section_ref'] or 'no ref'}): {r['description']}"
             for r in c.get("risk_clauses", [])
-        ])
+        )
+        obligation_lines = "\n".join(
+            f"  - {o['title']} | due: {o['due_date'] or 'event-based'} | team: {o['owner_team']}"
+            for o in c.get("obligations", [])
+        )
         context_parts.append(
             f"Contract #{c['id']}: {c['name']}\n"
             f"Type: {c['contract_type']} | Value: {'$' + str(int(c['total_value'])) if c['total_value'] else 'N/A'} {c['currency'] or ''}\n"
             f"Parties: {', '.join(c.get('parties') or [])}\n"
-            f"Expiry: {c['expiration_date'] or 'N/A'} | "
-            f"Auto-renewal: {'Yes, ' + str(c['auto_renewal_notice_days']) + 'd notice' if c['auto_renewal'] else 'No'}\n"
-            f"Risk clauses: {risk_summary}\n"
-            f"Summary: {(c.get('plain_english_summary') or '')[:400]}"
+            f"Expiry: {c['expiration_date'] or 'N/A'} | Governing law: {c.get('governing_law') or 'N/A'} | "
+            f"Auto-renewal: {'Yes, ' + str(c['auto_renewal_notice_days']) + 'd notice required' if c['auto_renewal'] else 'No'}\n"
+            f"Summary: {(c.get('plain_english_summary') or '')[:600]}\n"
+            f"Risk clauses:\n{risk_lines or '  None'}\n"
+            f"Obligations:\n{obligation_lines or '  None'}"
         )
 
     context = "\n\n---\n\n".join(context_parts)
     prompt = (
         "You are a contract intelligence assistant. Answer the user's question based ONLY on the contract data below. "
-        "Be specific — cite contract names and clause section references. "
+        "Be specific — cite contract names and exact clause section references. "
+        "Each result must include the contract_id (the integer N from 'Contract #N' in the data below). "
         "Return ONLY valid JSON, no markdown:\n"
         "{\n"
         '  "answer": "2-3 sentence narrative answer",\n'
         '  "results": [\n'
-        '    {"contract_name": "name", "relevant_value": "specific value or clause", "section_ref": "§ X.Y or empty string", "severity": "critical|high|medium|low|info"}\n'
+        '    {"contract_id": <integer N from Contract #N>, "contract_name": "name", "relevant_value": "specific value or clause text", "section_ref": "§ X.Y — Section Name or empty string", "severity": "critical|high|medium|low|info"}\n'
         "  ],\n"
         '  "recommendation": "One clear actionable recommendation, or null"\n'
         "}\n\n"
@@ -206,7 +329,7 @@ def search_with_claude(question: str, contracts: list) -> dict:
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
     return parse_claude_json(msg.content[0].text)
@@ -231,11 +354,13 @@ def contract_to_dict(c: Contract) -> dict:
         "currency": c.currency,
         "governing_law": c.governing_law,
         "plain_english_summary": c.plain_english_summary,
+        "has_pdf": bool(c.pdf_path and os.path.exists(c.pdf_path)),
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "risk_clauses": [
             {
                 "id": r.id, "type": r.type, "severity": r.severity,
                 "title": r.title, "description": r.description, "section_ref": r.section_ref,
+                "page_number": r.page_number, "text_snippet": r.text_snippet,
             }
             for r in c.risk_clauses
         ],
@@ -244,7 +369,8 @@ def contract_to_dict(c: Contract) -> dict:
                 "id": o.id, "title": o.title, "description": o.description,
                 "due_date": o.due_date, "frequency": o.frequency,
                 "owner_team": o.owner_team, "trigger_type": o.trigger_type,
-                "status": o.status,
+                "status": o.status, "section_ref": o.section_ref,
+                "page_number": o.page_number, "text_snippet": o.text_snippet,
             }
             for o in c.obligations
         ],
@@ -256,10 +382,12 @@ def contract_to_dict(c: Contract) -> dict:
 # ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    run_migrations()
     db = SessionLocal()
     try:
         if db.query(Contract).count() == 0:
             seed_database(db)
+        seed_users(db)
     finally:
         db.close()
     yield
@@ -272,6 +400,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ─────────────────────────────────────────────────────────────
+# Auth routes
+# ─────────────────────────────────────────────────────────────
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(401, "Invalid username or password")
+    token = secrets.token_urlsafe(32)
+    db.add(UserSession(token=token, user_id=user.id))
+    db.commit()
+    return {
+        "token": token,
+        "user": {"id": user.id, "username": user.username, "role": user.role, "full_name": user.full_name},
+    }
+
+
+@app.get("/api/auth/me")
+def me(current_user: User = Depends(get_current_user)):
+    return {"id": current_user.id, "username": current_user.username,
+            "role": current_user.role, "full_name": current_user.full_name}
+
+
+@app.post("/api/auth/logout")
+def logout(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        db.query(UserSession).filter(UserSession.token == token).delete()
+        db.commit()
+    return {"ok": True}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -294,18 +459,22 @@ def get_contract(contract_id: int, db: Session = Depends(get_db)):
 @app.post("/api/contracts/upload")
 async def upload_contract(file: UploadFile = File(...), db: Session = Depends(get_db)):
     contents = await file.read()
+    is_pdf = (file.filename or "").lower().endswith(".pdf")
 
-    # Extract text
-    try:
-        with pdfplumber.open(io.BytesIO(contents)) as pdf:
-            raw_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-    except Exception:
+    # Extract text with page markers (for PDF) or plain text
+    tagged_text = ""
+    if is_pdf:
         try:
-            raw_text = contents.decode("utf-8", errors="ignore")
+            tagged_text = extract_text_with_pages(contents)
+        except Exception:
+            pass
+    if not tagged_text:
+        try:
+            tagged_text = contents.decode("utf-8", errors="ignore")
         except Exception:
             raise HTTPException(400, "Could not read file. Please upload a PDF or text file.")
 
-    if len(raw_text.strip()) < 100:
+    if len(tagged_text.strip()) < 100:
         raise HTTPException(400, "File appears to be empty or unreadable.")
 
     # Create placeholder record
@@ -315,9 +484,17 @@ async def upload_contract(file: UploadFile = File(...), db: Session = Depends(ge
     db.commit()
     db.refresh(contract)
 
+    # Save the PDF file to disk
+    if is_pdf:
+        pdf_path = os.path.join(UPLOADS_DIR, f"{contract.id}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(contents)
+        contract.pdf_path = pdf_path
+        db.commit()
+
     # Extract with Claude
     try:
-        data = extract_with_claude(raw_text)
+        data = extract_with_claude(tagged_text)
     except Exception as e:
         contract.status = "error"
         db.commit()
@@ -343,6 +520,7 @@ async def upload_contract(file: UploadFile = File(...), db: Session = Depends(ge
             type=rc.get("type"), severity=rc.get("severity", "medium"),
             title=rc.get("title"), description=rc.get("description"),
             section_ref=rc.get("section_ref"),
+            page_number=rc.get("page_number"), text_snippet=rc.get("text_snippet"),
         ))
 
     for ob in data.get("obligations", []):
@@ -353,11 +531,23 @@ async def upload_contract(file: UploadFile = File(...), db: Session = Depends(ge
             owner_team=ob.get("owner_team"),
             trigger_type=ob.get("trigger_type", "time_based"),
             status="pending",
+            section_ref=ob.get("section_ref"),
+            page_number=ob.get("page_number"), text_snippet=ob.get("text_snippet"),
         ))
 
     db.commit()
     db.refresh(contract)
     return contract_to_dict(contract)
+
+
+@app.get("/api/contracts/{contract_id}/pdf")
+def get_contract_pdf(contract_id: int, db: Session = Depends(get_db)):
+    c = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not c:
+        raise HTTPException(404, "Contract not found")
+    if not c.pdf_path or not os.path.exists(c.pdf_path):
+        raise HTTPException(404, "No PDF file available for this contract")
+    return FileResponse(c.pdf_path, media_type="application/pdf", filename=f"{c.name}.pdf")
 
 
 class SearchRequest(BaseModel):

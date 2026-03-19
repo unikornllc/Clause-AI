@@ -10,6 +10,75 @@ function fmt(v) {
 
 const BAR_COLORS = ['gold', 'b2', 'b3', 'b4', 'b5']
 
+const SEV = {
+  critical: { label: 'CRITICAL', color: 'var(--red)',   bg: 'var(--red-dim)' },
+  high:     { label: 'HIGH',     color: 'var(--amber)',  bg: '#FEF3C7' },
+  medium:   { label: 'MEDIUM',   color: 'var(--blue)',   bg: '#DBEAFE' },
+  info:     { label: 'INFO',     color: 'var(--text-3)', bg: 'var(--surface-2)' },
+  good:     { label: 'GOOD',     color: 'var(--green)',  bg: 'var(--green-dim)' },
+}
+
+function Bullet({ sev, children }) {
+  const s = SEV[sev] || SEV.info
+  return (
+    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '9px 0', borderBottom: '1px solid var(--border)' }}>
+      <span style={{
+        flexShrink: 0, fontSize: 9, fontWeight: 700, letterSpacing: '0.6px',
+        padding: '2px 6px', borderRadius: 4, marginTop: 2,
+        color: s.color, background: s.bg,
+      }}>{s.label}</span>
+      <span style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: 1.55 }}>{children}</span>
+    </div>
+  )
+}
+
+function BriefingBullets({ renewing90, criticalNum, topVendor, topVendorPct, stats, fmt }) {
+  const bullets = []
+
+  renewing90.forEach(r => {
+    const overdue = r.days_until_cancel < 0
+    bullets.push({
+      sev: overdue ? 'critical' : 'high',
+      text: <><strong>{r.name}</strong> auto-renews in <strong>{r.days_until}d</strong> — cancellation window {overdue ? `missed by ${Math.abs(r.days_until_cancel)}d` : `closes in ${r.days_until_cancel}d`}. Value: {fmt(r.value)}.</>
+    })
+  })
+
+  if (criticalNum > 0) {
+    bullets.push({
+      sev: 'critical',
+      text: <><strong>{criticalNum} critical risk clause{criticalNum > 1 ? 's' : ''}</strong> flagged across portfolio — IP ownership, liability caps, and audit rights require legal review.</>
+    })
+  }
+
+  if (topVendorPct > 25) {
+    bullets.push({
+      sev: 'high',
+      text: <><strong>{topVendor?.name}</strong> accounts for <strong>{topVendorPct}%</strong> of total spend — exceeds 25% single-vendor concentration threshold. Diversification recommended.</>
+    })
+  }
+
+  const compliance = stats?.compliance_rate || 0
+  if (compliance >= 90) {
+    bullets.push({ sev: 'good', text: <>Obligation compliance at <strong>{compliance}%</strong> — portfolio is on track.</> })
+  } else if (compliance >= 70) {
+    bullets.push({ sev: 'medium', text: <>Obligation compliance at <strong>{compliance}%</strong> — review overdue items in Obligations tracker.</> })
+  } else if (compliance < 70) {
+    bullets.push({ sev: 'high', text: <>Obligation compliance at <strong>{compliance}%</strong> — significant overdue obligations, escalation required.</> })
+  }
+
+  if (bullets.length === 0) {
+    bullets.push({ sev: 'good', text: <>No critical items this week. Portfolio is in good standing.</> })
+  }
+
+  return (
+    <div>
+      {bullets.map((b, i) => (
+        <Bullet key={i} sev={b.sev}>{b.text}</Bullet>
+      ))}
+    </div>
+  )
+}
+
 export default function Executive({ navigate }) {
   const [stats,   setStats]   = useState(null)
   const [loading, setLoading] = useState(true)
@@ -154,32 +223,14 @@ export default function Executive({ navigate }) {
       {/* AI Weekly Briefing */}
       <div className="briefing-card">
         <div className="briefing-label">AI Weekly Briefing</div>
-        <div className="briefing-text">
-          {renewing90.length > 0 && (
-            <>
-              <strong>{renewing90.length} contract{renewing90.length > 1 ? 's' : ''} require immediate attention</strong> — their auto-renewal cancellation windows are approaching or have passed.
-              {renewing90.slice(0, 2).map(r => ` ${r.name} (${r.days_until}d to renewal)`).join(',')} represent{' '}
-              <span style={{ color: 'var(--amber)' }}>{fmt(stats?.renewing_90d_value)} in annual commitments</span> that
-              could lock in automatically without action.
-              <br /><br />
-            </>
-          )}
-          {criticalNum > 0 && (
-            <>
-              Your portfolio contains <strong>{criticalNum} critical risk clauses</strong> that require legal review — including
-              IP ownership claims and liability caps well below enterprise standards.
-              {topVendorPct > 25 && (
-                <>
-                  {' '}Additionally, <span style={{ color: 'var(--amber)' }}>{topVendor?.name} represents {topVendorPct}% of total vendor spend</span>, exceeding
-                  the recommended 25% single-vendor concentration threshold — a strategic supply-chain risk.
-                </>
-              )}
-              <br /><br />
-            </>
-          )}
-          <strong>Recommended this week:</strong> Prioritise renewal negotiations for the highest-value auto-renewing contracts,
-          and assign the {criticalNum} critical risk clauses to Legal for review before the next board meeting.
-        </div>
+        <BriefingBullets
+          renewing90={renewing90}
+          criticalNum={criticalNum}
+          topVendor={topVendor}
+          topVendorPct={topVendorPct}
+          stats={stats}
+          fmt={fmt}
+        />
       </div>
     </div>
   )

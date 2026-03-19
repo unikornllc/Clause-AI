@@ -1,15 +1,23 @@
 const NAV = [
   { id: 'dashboard',   label: 'Dashboard',         icon: '⬛', section: 'Overview' },
-  { id: 'upload',      label: 'Upload Contract',   icon: '⬆', section: null },
-  { id: 'brief',       label: 'Contract Brief',    icon: '📄', section: 'Intelligence' },
-  { id: 'search',      label: 'Ask Anything',      icon: '💬', section: null },
+  { id: 'exec',        label: 'Executive View',    icon: '📊', section: null },
+  { id: 'upload',      label: 'Upload Contract',   icon: '⬆', section: 'Contracts' },
+  { id: 'brief',       label: 'Contract Brief',    icon: '📄', section: null },
+  { id: 'search',      label: 'Ask Anything',      icon: '💬', section: 'Intelligence' },
   { id: 'risk',        label: 'Risk Map',          icon: '🔥', section: null },
-  { id: 'obligations', label: 'Obligations',       icon: '✅', section: null, badge: '2', badgeType: 'danger' },
-  { id: 'exec',        label: 'Executive View',    icon: '📊', section: 'Reporting' },
+  { id: 'obligations', label: 'Obligations',       icon: '✅', section: null },
 ]
 
-export default function Sidebar({ view, navigate }) {
+const ROLE_LABELS = {
+  legal:       'Legal Counsel',
+  procurement: 'Procurement',
+  executive:   'Executive',
+}
+
+export default function Sidebar({ view, navigate, obligationBadge, user, onLogout, allowedViews }) {
   let lastSection = null
+
+  const visibleNav = NAV.filter(n => allowedViews.includes(n.id))
 
   return (
     <div className="sidebar">
@@ -30,7 +38,7 @@ export default function Sidebar({ view, navigate }) {
       </div>
 
       <div className="sidebar-nav">
-        {NAV.map(n => {
+        {visibleNav.map(n => {
           const showSection = n.section && n.section !== lastSection
           if (n.section) lastSection = n.section
           return (
@@ -42,8 +50,8 @@ export default function Sidebar({ view, navigate }) {
               >
                 <span className="nav-icon">{n.icon}</span>
                 {n.label}
-                {n.badge && (
-                  <span className={`nav-badge ${n.badgeType || ''}`}>{n.badge}</span>
+                {n.id === 'obligations' && obligationBadge && (
+                  <span className="nav-badge danger">{obligationBadge}</span>
                 )}
               </div>
             </div>
@@ -52,12 +60,17 @@ export default function Sidebar({ view, navigate }) {
       </div>
 
       <div className="sidebar-footer">
-        <div className="org-badge">
-          <div className="org-avatar">AC</div>
-          <div>
-            <div className="org-name">Acme Corp</div>
-            <div className="org-plan">Enterprise Plan</div>
+        <div className="sidebar-user">
+          <div className="sidebar-user-avatar">
+            {user?.full_name?.split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase()}
           </div>
+          <div className="sidebar-user-info">
+            <div className="sidebar-user-name">{user?.full_name}</div>
+            <div className="sidebar-user-role">{ROLE_LABELS[user?.role] || user?.role}</div>
+          </div>
+          <button className="sidebar-logout-btn" onClick={onLogout} title="Sign out">
+            ⎋
+          </button>
         </div>
       </div>
     </div>

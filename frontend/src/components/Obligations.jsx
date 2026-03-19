@@ -48,6 +48,7 @@ export default function Obligations({ navigate }) {
   const overdue   = timed.filter(o => o.status !== 'completed' && daysUntil(o.due_date) !== null && daysUntil(o.due_date) < 0)
   const soon      = timed.filter(o => o.status !== 'completed' && daysUntil(o.due_date) !== null && daysUntil(o.due_date) >= 0 && daysUntil(o.due_date) < 30)
   const upcoming  = timed.filter(o => o.status !== 'completed' && daysUntil(o.due_date) !== null && daysUntil(o.due_date) >= 30)
+  const undated   = timed.filter(o => o.status !== 'completed' && o.due_date == null)
   const completed = timed.filter(o => o.status === 'completed')
 
   function ObligationCard({ o }) {
@@ -133,6 +134,15 @@ export default function Obligations({ navigate }) {
           <div className="section-title" style={{ marginBottom: 12 }}>Upcoming</div>
           <div className="obl-grid">
             {upcoming.map(o => <ObligationCard key={o.id} o={o} />)}
+          </div>
+        </div>
+      )}
+
+      {undated.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <div className="section-title" style={{ marginBottom: 12 }}>No Due Date</div>
+          <div className="obl-grid">
+            {undated.map(o => <ObligationCard key={o.id} o={o} />)}
           </div>
         </div>
       )}
