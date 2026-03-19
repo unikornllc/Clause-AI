@@ -1,0 +1,723 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Boolean,
+    Float, Text, DateTime, ForeignKey,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
+from sqlalchemy.types import JSON as SAJson
+from contextlib import asynccontextmanager
+from datetime import datetime, date, timedelta
+from typing import Optional, List
+from pydantic import BaseModel
+import anthropic
+import pdfplumber
+import json
+import os
+import io
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─────────────────────────────────────────────────────────────
+# Database
+# ─────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+engine = create_engine(
+    f"sqlite:///{os.path.join(BASE_DIR, 'contracts.db')}",
+    connect_args={"check_same_thread": False},
+)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# Models
+# ─────────────────────────────────────────────────────────────
+class Contract(Base):
+    __tablename__ = "contracts"
+    id                       = Column(Integer, primary_key=True)
+    name                     = Column(String, nullable=False)
+    status                   = Column(String, default="processing")
+    contract_type            = Column(String)
+    parties                  = Column(SAJson)
+    effective_date           = Column(String)
+    expiration_date          = Column(String)
+    auto_renewal             = Column(Boolean, default=False)
+    auto_renewal_notice_days = Column(Integer)
+    auto_renewal_term_years  = Column(Integer)
+    total_value              = Column(Float)
+    currency                 = Column(String, default="USD")
+    governing_law            = Column(String)
+    plain_english_summary    = Column(Text)
+    created_at               = Column(DateTime, default=datetime.utcnow)
+    risk_clauses  = relationship("RiskClause",  back_populates="contract", cascade="all, delete-orphan")
+    obligations   = relationship("Obligation",  back_populates="contract", cascade="all, delete-orphan")
+
+
+class RiskClause(Base):
+    __tablename__ = "risk_clauses"
+    id          = Column(Integer, primary_key=True)
+    contract_id = Column(Integer, ForeignKey("contracts.id"))
+    type        = Column(String)
+    severity    = Column(String)
+    title       = Column(String)
+    description = Column(Text)
+    section_ref = Column(String)
+    contract    = relationship("Contract", back_populates="risk_clauses")
+
+
+class Obligation(Base):
+    __tablename__ = "obligations"
+    id           = Column(Integer, primary_key=True)
+    contract_id  = Column(Integer, ForeignKey("contracts.id"))
+    title        = Column(String)
+    description  = Column(Text)
+    due_date     = Column(String)
+    frequency    = Column(String)
+    owner_team   = Column(String)
+    trigger_type = Column(String, default="time_based")
+    status       = Column(String, default="pending")
+    contract     = relationship("Contract", back_populates="obligations")
+
+
+Base.metadata.create_all(bind=engine)
+
+
+# ─────────────────────────────────────────────────────────────
+# AI Extraction
+# ─────────────────────────────────────────────────────────────
+EXTRACTION_PROMPT = """You are a contract analysis AI. Extract information from this contract and return ONLY valid JSON — no markdown, no code fences, no extra text.
+
+Return exactly this structure:
+{
+  "contract_type": "SaaS" | "NDA" | "MSA" | "Employment" | "Services" | "Data" | "Cloud" | "Other",
+  "parties": ["Party 1", "Party 2"],
+  "effective_date": "YYYY-MM-DD or null",
+  "expiration_date": "YYYY-MM-DD or null",
+  "auto_renewal": true or false,
+  "auto_renewal_notice_days": number or null,
+  "auto_renewal_term_years": number or null,
+  "total_value": number or null,
+  "currency": "USD" | "GBP" | "EUR" | null,
+  "governing_law": "jurisdiction string or null",
+  "plain_english_summary": "Write 2-3 paragraphs in plain English: (1) what this contract does and key terms, (2) what is most concerning or risky, (3) what the reader should do now. Use **bold** for critical items. No legal jargon.",
+  "risk_clauses": [
+    {
+      "type": "liability_cap" | "ip_ownership" | "auto_renewal" | "price_change" | "termination" | "indemnification" | "audit_rights" | "data_ownership" | "non_compete" | "sla_penalty",
+      "severity": "critical" | "high" | "medium" | "low",
+      "title": "Short descriptive title (6 words max)",
+      "description": "1-2 sentences explaining the risk in plain English",
+      "section_ref": "§ X.Y — Section Name"
+    }
+  ],
+  "obligations": [
+    {
+      "title": "Short obligation title",
+      "description": "What specifically must be done",
+      "due_date": "YYYY-MM-DD or null",
+      "frequency": "one_time" | "monthly" | "quarterly" | "annual" | "event_based",
+      "owner_team": "Legal" | "Finance" | "IT" | "Procurement" | "Operations" | "HR",
+      "trigger_type": "time_based" | "event_based"
+    }
+  ]
+}
+
+Contract text:
+"""
+
+
+def parse_claude_json(text: str) -> dict:
+    """Robustly parse JSON from Claude output, stripping markdown fences if present."""
+    text = text.strip()
+    if "```" in text:
+        for block in text.split("```"):
+            block = block.strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            try:
+                return json.loads(block)
+            except json.JSONDecodeError:
+                continue
+    return json.loads(text)
+
+
+def extract_with_claude(text: str) -> dict:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set in environment")
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": EXTRACTION_PROMPT + text[:50000]}],
+    )
+    return parse_claude_json(msg.content[0].text)
+
+
+def search_with_claude(question: str, contracts: list) -> dict:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set in environment")
+
+    context_parts = []
+    for c in contracts:
+        risk_summary = json.dumps([
+            {"title": r["title"], "severity": r["severity"], "type": r["type"], "section": r["section_ref"]}
+            for r in c.get("risk_clauses", [])
+        ])
+        context_parts.append(
+            f"Contract #{c['id']}: {c['name']}\n"
+            f"Type: {c['contract_type']} | Value: {'$' + str(int(c['total_value'])) if c['total_value'] else 'N/A'} {c['currency'] or ''}\n"
+            f"Parties: {', '.join(c.get('parties') or [])}\n"
+            f"Expiry: {c['expiration_date'] or 'N/A'} | "
+            f"Auto-renewal: {'Yes, ' + str(c['auto_renewal_notice_days']) + 'd notice' if c['auto_renewal'] else 'No'}\n"
+            f"Risk clauses: {risk_summary}\n"
+            f"Summary: {(c.get('plain_english_summary') or '')[:400]}"
+        )
+
+    context = "\n\n---\n\n".join(context_parts)
+    prompt = (
+        "You are a contract intelligence assistant. Answer the user's question based ONLY on the contract data below. "
+        "Be specific — cite contract names and clause section references. "
+        "Return ONLY valid JSON, no markdown:\n"
+        "{\n"
+        '  "answer": "2-3 sentence narrative answer",\n'
+        '  "results": [\n'
+        '    {"contract_name": "name", "relevant_value": "specific value or clause", "section_ref": "§ X.Y or empty string", "severity": "critical|high|medium|low|info"}\n'
+        "  ],\n"
+        '  "recommendation": "One clear actionable recommendation, or null"\n'
+        "}\n\n"
+        f"Contracts:\n{context}\n\n"
+        f"Question: {question}"
+    )
+
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return parse_claude_json(msg.content[0].text)
+
+
+# ─────────────────────────────────────────────────────────────
+# Serialisation helpers
+# ─────────────────────────────────────────────────────────────
+def contract_to_dict(c: Contract) -> dict:
+    return {
+        "id": c.id,
+        "name": c.name,
+        "status": c.status,
+        "contract_type": c.contract_type,
+        "parties": c.parties or [],
+        "effective_date": c.effective_date,
+        "expiration_date": c.expiration_date,
+        "auto_renewal": c.auto_renewal,
+        "auto_renewal_notice_days": c.auto_renewal_notice_days,
+        "auto_renewal_term_years": c.auto_renewal_term_years,
+        "total_value": c.total_value,
+        "currency": c.currency,
+        "governing_law": c.governing_law,
+        "plain_english_summary": c.plain_english_summary,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "risk_clauses": [
+            {
+                "id": r.id, "type": r.type, "severity": r.severity,
+                "title": r.title, "description": r.description, "section_ref": r.section_ref,
+            }
+            for r in c.risk_clauses
+        ],
+        "obligations": [
+            {
+                "id": o.id, "title": o.title, "description": o.description,
+                "due_date": o.due_date, "frequency": o.frequency,
+                "owner_team": o.owner_team, "trigger_type": o.trigger_type,
+                "status": o.status,
+            }
+            for o in c.obligations
+        ],
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# App & lifespan
+# ─────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db = SessionLocal()
+    try:
+        if db.query(Contract).count() == 0:
+            seed_database(db)
+    finally:
+        db.close()
+    yield
+
+
+app = FastAPI(title="Clause API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────
+@app.get("/api/contracts")
+def list_contracts(db: Session = Depends(get_db)):
+    contracts = db.query(Contract).order_by(Contract.expiration_date).all()
+    return [contract_to_dict(c) for c in contracts]
+
+
+@app.get("/api/contracts/{contract_id}")
+def get_contract(contract_id: int, db: Session = Depends(get_db)):
+    c = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not c:
+        raise HTTPException(404, "Contract not found")
+    return contract_to_dict(c)
+
+
+@app.post("/api/contracts/upload")
+async def upload_contract(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    contents = await file.read()
+
+    # Extract text
+    try:
+        with pdfplumber.open(io.BytesIO(contents)) as pdf:
+            raw_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception:
+        try:
+            raw_text = contents.decode("utf-8", errors="ignore")
+        except Exception:
+            raise HTTPException(400, "Could not read file. Please upload a PDF or text file.")
+
+    if len(raw_text.strip()) < 100:
+        raise HTTPException(400, "File appears to be empty or unreadable.")
+
+    # Create placeholder record
+    display_name = (file.filename or "Unnamed Contract").replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
+    contract = Contract(name=display_name, status="processing")
+    db.add(contract)
+    db.commit()
+    db.refresh(contract)
+
+    # Extract with Claude
+    try:
+        data = extract_with_claude(raw_text)
+    except Exception as e:
+        contract.status = "error"
+        db.commit()
+        raise HTTPException(500, f"AI extraction failed: {e}")
+
+    # Persist extracted data
+    contract.status            = "completed"
+    contract.contract_type     = data.get("contract_type")
+    contract.parties           = data.get("parties", [])
+    contract.effective_date    = data.get("effective_date")
+    contract.expiration_date   = data.get("expiration_date")
+    contract.auto_renewal      = data.get("auto_renewal", False)
+    contract.auto_renewal_notice_days = data.get("auto_renewal_notice_days")
+    contract.auto_renewal_term_years  = data.get("auto_renewal_term_years")
+    contract.total_value       = data.get("total_value")
+    contract.currency          = data.get("currency", "USD")
+    contract.governing_law     = data.get("governing_law")
+    contract.plain_english_summary = data.get("plain_english_summary")
+
+    for rc in data.get("risk_clauses", []):
+        db.add(RiskClause(
+            contract_id=contract.id,
+            type=rc.get("type"), severity=rc.get("severity", "medium"),
+            title=rc.get("title"), description=rc.get("description"),
+            section_ref=rc.get("section_ref"),
+        ))
+
+    for ob in data.get("obligations", []):
+        db.add(Obligation(
+            contract_id=contract.id,
+            title=ob.get("title"), description=ob.get("description"),
+            due_date=ob.get("due_date"), frequency=ob.get("frequency", "one_time"),
+            owner_team=ob.get("owner_team"),
+            trigger_type=ob.get("trigger_type", "time_based"),
+            status="pending",
+        ))
+
+    db.commit()
+    db.refresh(contract)
+    return contract_to_dict(contract)
+
+
+class SearchRequest(BaseModel):
+    question: str
+    contract_id: Optional[int] = None
+
+
+@app.post("/api/search")
+def search_contracts(req: SearchRequest, db: Session = Depends(get_db)):
+    query = db.query(Contract).filter(Contract.status == "completed")
+    if req.contract_id:
+        query = query.filter(Contract.id == req.contract_id)
+    contracts = query.all()
+    if not contracts:
+        return {"answer": "No contracts found in the system.", "results": [], "recommendation": None}
+    contract_dicts = [contract_to_dict(c) for c in contracts]
+    try:
+        return search_with_claude(req.question, contract_dicts)
+    except Exception as e:
+        raise HTTPException(500, f"Search failed: {e}")
+
+
+@app.delete("/api/contracts/{contract_id}")
+def delete_contract(contract_id: int, db: Session = Depends(get_db)):
+    c = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not c:
+        raise HTTPException(404, "Contract not found")
+    db.delete(c)
+    db.commit()
+    return {"deleted": contract_id}
+
+
+@app.get("/api/obligations")
+def get_obligations(db: Session = Depends(get_db)):
+    obligations = db.query(Obligation).all()
+    return [
+        {
+            "id": o.id,
+            "contract_id": o.contract_id,
+            "contract_name": o.contract.name if o.contract else "Unknown",
+            "title": o.title,
+            "description": o.description,
+            "due_date": o.due_date,
+            "frequency": o.frequency,
+            "owner_team": o.owner_team,
+            "trigger_type": o.trigger_type,
+            "status": o.status,
+        }
+        for o in obligations
+    ]
+
+
+@app.put("/api/obligations/{obligation_id}/complete")
+def complete_obligation(obligation_id: int, db: Session = Depends(get_db)):
+    o = db.query(Obligation).filter(Obligation.id == obligation_id).first()
+    if not o:
+        raise HTTPException(404, "Obligation not found")
+    o.status = "completed"
+    db.commit()
+    return {"status": "completed"}
+
+
+@app.get("/api/stats")
+def get_stats(db: Session = Depends(get_db)):
+    today = date.today()
+    contracts = db.query(Contract).filter(Contract.status == "completed").all()
+
+    total_value = sum(c.total_value or 0 for c in contracts)
+
+    # Renewal timeline (next 180 days)
+    timeline = []
+    renewing_90d = []
+    for c in contracts:
+        if not c.expiration_date:
+            continue
+        try:
+            exp = date.fromisoformat(c.expiration_date)
+        except ValueError:
+            continue
+        days_until = (exp - today).days
+        status = "critical" if days_until < 30 else "warn" if days_until < 90 else "ok"
+        item = {
+            "id": c.id, "name": c.name, "expiration_date": c.expiration_date,
+            "days_until": days_until, "status": status,
+            "auto_renewal": c.auto_renewal, "value": c.total_value,
+        }
+        timeline.append(item)
+        if 0 <= days_until <= 90 and c.auto_renewal:
+            notice = c.auto_renewal_notice_days or 30
+            cancel_by = exp - timedelta(days=notice)
+            renewing_90d.append({**item, "cancel_by": cancel_by.isoformat(),
+                                  "days_until_cancel": (cancel_by - today).days,
+                                  "currency": c.currency})
+
+    timeline.sort(key=lambda x: x["days_until"])
+
+    # Risk counts
+    critical_count = db.query(RiskClause).filter(RiskClause.severity == "critical").count()
+
+    # Compliance rate
+    total_obl = db.query(Obligation).count()
+    done_obl  = db.query(Obligation).filter(Obligation.status == "completed").count()
+    compliance_rate = int((done_obl / total_obl * 100) if total_obl > 0 else 0)
+
+    # Vendor spend
+    vendor_spend = sorted(
+        [{"name": (c.parties or [c.name])[0], "value": c.total_value or 0, "id": c.id}
+         for c in contracts if c.total_value],
+        key=lambda x: x["value"], reverse=True
+    )
+
+    # Quarterly commitments
+    quarters = {}
+    for c in contracts:
+        if not c.expiration_date or not c.total_value:
+            continue
+        try:
+            exp = date.fromisoformat(c.expiration_date)
+        except ValueError:
+            continue
+        # Spread annual value across active quarters
+        monthly = (c.total_value / 12)
+        for m_offset in range(12):
+            d = today.replace(day=1) + timedelta(days=m_offset * 30)
+            if d > exp:
+                break
+            q = f"Q{(d.month - 1) // 3 + 1} {d.year}"
+            quarters[q] = quarters.get(q, 0) + monthly
+
+    quarterly = [{"quarter": k, "value": round(v)} for k, v in sorted(quarters.items())[:6]]
+
+    return {
+        "total_contracts": len(contracts),
+        "total_value": total_value,
+        "renewing_90d_count": len(renewing_90d),
+        "renewing_90d_value": sum(r["value"] or 0 for r in renewing_90d),
+        "critical_risks": critical_count,
+        "compliance_rate": compliance_rate,
+        "timeline": timeline,
+        "renewing_90d": renewing_90d,
+        "vendor_spend": vendor_spend,
+        "quarterly": quarterly,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Seed data
+# ─────────────────────────────────────────────────────────────
+SEED = [
+    {
+        "name": "Salesforce Enterprise License",
+        "status": "completed", "contract_type": "SaaS",
+        "parties": ["Acme Corp", "Salesforce Inc."],
+        "effective_date": "2024-05-22", "expiration_date": "2026-05-22",
+        "auto_renewal": True, "auto_renewal_notice_days": 90, "auto_renewal_term_years": 2,
+        "total_value": 180000, "currency": "USD", "governing_law": "California, USA",
+        "plain_english_summary": (
+            "You are licensed to use Salesforce's CRM platform until **May 22, 2026** at $180,000/year. "
+            "The critical issue: you had to notify Salesforce of cancellation by **February 21, 2026** — "
+            "that window has now **closed**, locking you into another 2-year term unless you negotiate an exit.\n\n"
+            "Salesforce can increase pricing by up to 7% annually with 60 days notice, and their broad mutual "
+            "indemnification clause may expose you to their legal costs in third-party IP claims. "
+            "Your liability cap is fees paid in the prior 12 months (~$180k).\n\n"
+            "**Recommended action:** Contact your Salesforce account executive immediately to negotiate "
+            "renewal terms before the new term activates on May 22."
+        ),
+        "risk_clauses": [
+            {"type": "auto_renewal", "severity": "critical",
+             "title": "Auto-Renewal Window Expired",
+             "description": "Cancellation notice was required by Feb 21, 2026. That deadline has passed — you are locked into a 2-year renewal from May 22, 2026.",
+             "section_ref": "§ 14.1 — Term and Renewal"},
+            {"type": "price_change", "severity": "high",
+             "title": "Annual Price Escalation Right",
+             "description": "Salesforce may increase fees up to 7% per year with 60 days written notice. No customer consent required.",
+             "section_ref": "§ 5.3 — Fee Adjustments"},
+            {"type": "indemnification", "severity": "high",
+             "title": "Broad Mutual Indemnification",
+             "description": "Both parties must indemnify each other for third-party IP infringement claims. Scope is broad and may expose you to unexpected legal costs.",
+             "section_ref": "§ 11.2 — Indemnification"},
+            {"type": "liability_cap", "severity": "medium",
+             "title": "12-Month Fee Liability Cap",
+             "description": "Total liability capped at fees paid in prior 12 months (~$180k). Market standard but worth noting for critical dependencies.",
+             "section_ref": "§ 12.1 — Limitation of Liability"},
+        ],
+        "obligations": [
+            {"title": "User access reconciliation report", "description": "Submit quarterly reconciliation of all active Salesforce users vs. licensed seats",
+             "due_date": "2026-04-30", "frequency": "quarterly", "owner_team": "IT", "trigger_type": "time_based", "status": "pending"},
+            {"title": "Renewal decision — window passed", "description": "Cancellation notice required by Feb 21, 2026 — this deadline has now passed",
+             "due_date": "2026-02-21", "frequency": "one_time", "owner_team": "Procurement", "trigger_type": "time_based", "status": "overdue"},
+        ],
+    },
+    {
+        "name": "ZetaCo Data License",
+        "status": "completed", "contract_type": "Data",
+        "parties": ["Acme Corp", "ZetaCo Ltd"],
+        "effective_date": "2024-06-12", "expiration_date": "2026-04-10",
+        "auto_renewal": True, "auto_renewal_notice_days": 90, "auto_renewal_term_years": 2,
+        "total_value": 22000, "currency": "USD", "governing_law": "England & Wales",
+        "plain_english_summary": (
+            "You are licensed to use ZetaCo's market data feed until **April 10, 2026** — that's in about 23 days. "
+            "You needed to notify them of cancellation by January 10, 2026 — **that window closed** three months ago. "
+            "You are now locked into another 2-year term at $22,000/year unless you negotiate out immediately.\n\n"
+            "The most concerning clause: ZetaCo **claims ownership over any derivative works, models, or analytics** "
+            "built using their data feed — even if you built them entirely in-house. They can also raise prices up to 15% annually "
+            "with just 30 days notice.\n\n"
+            "**Action required now:** Contact ZetaCo today to negotiate an exit or carve out ownership of your internally-built derivatives. "
+            "This is both an auto-renewal emergency and a material IP risk."
+        ),
+        "risk_clauses": [
+            {"type": "ip_ownership", "severity": "critical",
+             "title": "Derivative Works Ownership Claim",
+             "description": "ZetaCo claims rights over analytics, models, or tools derived from their data — even those built entirely by your team using your own resources.",
+             "section_ref": "§ 7.3 — Intellectual Property"},
+            {"type": "auto_renewal", "severity": "critical",
+             "title": "Renewal Lock-In — Window Expired",
+             "description": "90-day cancellation notice was required by Jan 10, 2026. Window has passed. Auto-renews April 10 for 2 additional years.",
+             "section_ref": "§ 12.1 — Term & Renewal"},
+            {"type": "price_change", "severity": "high",
+             "title": "15% Annual Price Increase Right",
+             "description": "ZetaCo can increase annual fees up to 15% with only 30 days notice. No negotiation or consent required.",
+             "section_ref": "§ 4.2 — Fee Adjustments"},
+            {"type": "audit_rights", "severity": "medium",
+             "title": "Annual Usage Audit Rights",
+             "description": "ZetaCo can audit your data usage logs with 5 business days notice, once per year.",
+             "section_ref": "§ 9.1 — Audit Rights"},
+        ],
+        "obligations": [
+            {"title": "Q4 usage report submission", "description": "Submit quarterly data usage report to ZetaCo by January 10 each year",
+             "due_date": "2026-01-10", "frequency": "quarterly", "owner_team": "Operations", "trigger_type": "time_based", "status": "overdue"},
+            {"title": "Security incident notification", "description": "Notify ZetaCo within 72 hours of any security incident involving their data",
+             "due_date": None, "frequency": "event_based", "owner_team": "IT", "trigger_type": "event_based", "status": "pending"},
+        ],
+    },
+    {
+        "name": "AWS Enterprise Support",
+        "status": "completed", "contract_type": "Cloud",
+        "parties": ["Acme Corp", "Amazon Web Services"],
+        "effective_date": "2024-08-10", "expiration_date": "2026-08-10",
+        "auto_renewal": True, "auto_renewal_notice_days": 60, "auto_renewal_term_years": 1,
+        "total_value": 96000, "currency": "USD", "governing_law": "Washington, USA",
+        "plain_english_summary": (
+            "This agreement covers AWS Enterprise Support at $96,000/year, providing dedicated technical account management "
+            "and 15-minute critical issue response times. The contract expires **August 10, 2026** — you have until "
+            "**June 11, 2026** to cancel if you don't want to renew.\n\n"
+            "The main risk is a broad indemnification clause requiring you to defend AWS against claims arising from your "
+            "infrastructure configuration. There's also no cash SLA penalty: uptime failures result only in service credits "
+            "(up to 30% of monthly fee), with no right to terminate.\n\n"
+            "This is a relatively standard enterprise cloud agreement. The 60-day cancellation window gives you reasonable notice. "
+            "Consider negotiating the indemnification scope and adding cash SLA penalties at renewal."
+        ),
+        "risk_clauses": [
+            {"type": "indemnification", "severity": "high",
+             "title": "Broad Customer Indemnification",
+             "description": "You must defend and indemnify AWS against third-party claims arising from your use or misconfiguration of AWS services.",
+             "section_ref": "§ 8.2 — Indemnification"},
+            {"type": "sla_penalty", "severity": "high",
+             "title": "Credits-Only SLA Remedy",
+             "description": "AWS uptime SLA breaches result only in service credits (up to 30% of monthly fee). No cash compensation or termination rights.",
+             "section_ref": "§ 5.1 — Service Level Agreement"},
+            {"type": "termination", "severity": "medium",
+             "title": "AWS Immediate Termination Right",
+             "description": "AWS can terminate immediately for violation of their Acceptable Use Policy, which they may update with 30 days notice.",
+             "section_ref": "§ 14.3 — Termination for Cause"},
+        ],
+        "obligations": [
+            {"title": "Annual penetration test certification", "description": "Submit proof of annual penetration test to AWS Security team",
+             "due_date": "2026-01-31", "frequency": "annual", "owner_team": "IT", "trigger_type": "time_based", "status": "overdue"},
+            {"title": "SOC 2 Type II report submission", "description": "Provide current SOC 2 Type II report to AWS compliance portal",
+             "due_date": "2026-05-15", "frequency": "annual", "owner_team": "IT", "trigger_type": "time_based", "status": "pending"},
+        ],
+    },
+    {
+        "name": "BetaTech Services MSA",
+        "status": "completed", "contract_type": "Services",
+        "parties": ["Acme Corp", "BetaTech GmbH"],
+        "effective_date": "2025-04-05", "expiration_date": "2026-04-05",
+        "auto_renewal": False, "auto_renewal_notice_days": None, "auto_renewal_term_years": None,
+        "total_value": 45000, "currency": "USD", "governing_law": "Germany",
+        "plain_english_summary": (
+            "BetaTech provides software development services under this MSA at $45,000 for 12 months. "
+            "The contract expires **April 5, 2026** — in 18 days — and does **not** auto-renew. "
+            "You must actively decide to renew or it simply lapses.\n\n"
+            "The most material risk: **BetaTech's maximum liability to you is only $100,000** regardless of actual damage. "
+            "Given their access to your production codebase and customer data, this cap is dangerously low. "
+            "There is also no explicit IP assignment clause — ownership of deliverables is legally ambiguous under German law.\n\n"
+            "**At renewal, prioritise:** (1) increasing the liability cap to ≥$500k, (2) adding explicit IP assignment "
+            "for all deliverables, (3) adding a data breach notification clause. Renewal must be decided before April 5."
+        ),
+        "risk_clauses": [
+            {"type": "liability_cap", "severity": "critical",
+             "title": "$100k Liability Cap",
+             "description": "BetaTech's total liability is capped at $100,000 — far below engagement scope. A significant breach would leave you with minimal recourse.",
+             "section_ref": "§ 11.2 — Limitation of Liability"},
+            {"type": "ip_ownership", "severity": "high",
+             "title": "No IP Assignment Clause",
+             "description": "No explicit clause assigns ownership of deliverables to you. IP ownership of work product is ambiguous under German law.",
+             "section_ref": "§ 6 — Intellectual Property (absent)"},
+            {"type": "termination", "severity": "high",
+             "title": "BetaTech Convenience Termination",
+             "description": "BetaTech can terminate for any reason with 30 days notice — potentially abandoning in-progress projects mid-delivery.",
+             "section_ref": "§ 13.2 — Termination for Convenience"},
+        ],
+        "obligations": [
+            {"title": "Quarterly service review meeting", "description": "Joint review meeting with BetaTech to assess project progress and upcoming milestones",
+             "due_date": "2026-03-31", "frequency": "quarterly", "owner_team": "Procurement", "trigger_type": "time_based", "status": "pending"},
+            {"title": "Renewal decision deadline", "description": "Decide whether to renew before April 5 — no auto-renewal on this agreement",
+             "due_date": "2026-03-26", "frequency": "one_time", "owner_team": "Procurement", "trigger_type": "time_based", "status": "pending"},
+        ],
+    },
+    {
+        "name": "Acme–Pinnacle NDA",
+        "status": "completed", "contract_type": "NDA",
+        "parties": ["Acme Corp", "Pinnacle Ventures"],
+        "effective_date": "2025-12-01", "expiration_date": "2026-12-01",
+        "auto_renewal": False, "auto_renewal_notice_days": None, "auto_renewal_term_years": None,
+        "total_value": None, "currency": None, "governing_law": "New York, USA",
+        "plain_english_summary": (
+            "Standard mutual NDA covering discussions with Pinnacle Ventures around a potential partnership. "
+            "Both parties agree to keep each other's information confidential for **3 years from the date of disclosure** "
+            "(not just the contract term). The agreement expires December 1, 2026 with no auto-renewal.\n\n"
+            "The main constraint is a **non-solicitation clause**: neither party can solicit the other's employees for "
+            "12 months after termination. This may affect recruiting if any Pinnacle staff are of interest.\n\n"
+            "This is a low-risk agreement. The only ongoing obligation is ensuring staff who received Pinnacle's "
+            "confidential information are reminded of their obligations annually."
+        ),
+        "risk_clauses": [
+            {"type": "non_compete", "severity": "medium",
+             "title": "12-Month Non-Solicitation",
+             "description": "Neither party can solicit the other's employees for 12 months after termination. May limit recruiting options.",
+             "section_ref": "§ 8 — Non-Solicitation"},
+            {"type": "liability_cap", "severity": "low",
+             "title": "No Liability Cap on Breach",
+             "description": "No explicit cap — full injunctive relief and damages are available for unauthorised disclosure. Standard for NDAs.",
+             "section_ref": "§ 11 — Remedies"},
+        ],
+        "obligations": [
+            {"title": "Annual staff confidentiality reminder", "description": "Remind staff who received Pinnacle information of confidentiality obligations",
+             "due_date": "2026-06-01", "frequency": "annual", "owner_team": "Legal", "trigger_type": "time_based", "status": "pending"},
+        ],
+    },
+]
+
+
+def seed_database(db: Session):
+    for seed in SEED:
+        c = Contract(
+            name=seed["name"], status=seed["status"],
+            contract_type=seed["contract_type"], parties=seed["parties"],
+            effective_date=seed["effective_date"], expiration_date=seed["expiration_date"],
+            auto_renewal=seed["auto_renewal"],
+            auto_renewal_notice_days=seed["auto_renewal_notice_days"],
+            auto_renewal_term_years=seed["auto_renewal_term_years"],
+            total_value=seed["total_value"], currency=seed["currency"],
+            governing_law=seed["governing_law"],
+            plain_english_summary=seed["plain_english_summary"],
+        )
+        db.add(c)
+        db.flush()
+        for rc in seed.get("risk_clauses", []):
+            db.add(RiskClause(contract_id=c.id, **rc))
+        for ob in seed.get("obligations", []):
+            db.add(Obligation(contract_id=c.id, **ob))
+        db.commit()
