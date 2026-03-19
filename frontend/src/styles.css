@@ -24,9 +24,20 @@ html, body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: 'DM Sans', sans-serif;
+  font-family: 'DM Sans', 'IBM Plex Arabic', sans-serif;
   font-size: 14px;
   line-height: 1.5;
+}
+
+/* RTL text — applied via dir="auto" on individual content elements */
+[dir="rtl"], [dir="auto"]:is([lang="ar"], :has([lang="ar"])) {
+  font-family: 'IBM Plex Arabic', 'DM Sans', sans-serif;
+  line-height: 1.8;  /* Arabic needs more line height */
+}
+
+/* Any element with dir="auto" containing Arabic renders correctly */
+p[dir="auto"], div[dir="auto"], span[dir="auto"] {
+  unicode-bidi: plaintext;
 }
 
 ::-webkit-scrollbar { width: 5px; height: 5px; }

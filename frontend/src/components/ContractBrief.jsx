@@ -28,7 +28,7 @@ function Summary({ text }) {
       {paras.map((para, pi) => {
         const tokens = para.split(/(\*\*[^*]+\*\*)/g)
         return (
-          <p key={pi}>
+          <p key={pi} dir="auto">
             {tokens.map((tok, ti) =>
               tok.startsWith('**') && tok.endsWith('**')
                 ? <strong key={ti}>{tok.slice(2, -2)}</strong>
@@ -242,14 +242,14 @@ export default function ContractBrief({ contractId, navigate, focusClause }) {
                   >
                     <div className={`risk-dot ${r.severity}`} />
                     <div style={{ flex: 1 }}>
-                      <div className="risk-text-title">
+                      <div className="risk-text-title" dir="auto">
                         {r.title}
                         {hasPdf && r.page_number && (
                           <span className="risk-page-badge">p.{r.page_number}</span>
                         )}
                       </div>
-                      <div className="risk-text-desc">{r.description}</div>
-                      {r.section_ref && <div className="risk-text-clause">{r.section_ref}</div>}
+                      <div className="risk-text-desc" dir="auto">{r.description}</div>
+                      {r.section_ref && <div className="risk-text-clause" dir="auto">{r.section_ref}</div>}
                     </div>
                   </div>
                 )
@@ -283,7 +283,7 @@ export default function ContractBrief({ contractId, navigate, focusClause }) {
                       onClick={() => hasPdf && o.page_number && handleItemClick(o, 'obligation')}
                     >
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{ fontSize: 12, fontWeight: 600, flex: 1 }}>{o.title}</span>
+                        <span style={{ fontSize: 12, fontWeight: 600, flex: 1 }} dir="auto">{o.title}</span>
                         {hasPdf && o.page_number && (
                           <span className="risk-page-badge">p.{o.page_number}</span>
                         )}

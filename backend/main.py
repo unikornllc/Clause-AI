@@ -65,6 +65,7 @@ class Contract(Base):
     governing_law            = Column(String)
     plain_english_summary    = Column(Text)
     pdf_path                 = Column(String)   # path to stored PDF file
+    language                 = Column(String, default="en")  # detected language code
     created_at               = Column(DateTime, default=datetime.utcnow)
     risk_clauses  = relationship("RiskClause",  back_populates="contract", cascade="all, delete-orphan")
     obligations   = relationship("Obligation",  back_populates="contract", cascade="all, delete-orphan")
@@ -156,6 +157,7 @@ def run_migrations():
     with engine.connect() as conn:
         for table, column, dtype in [
             ("contracts",    "pdf_path",    "TEXT"),
+            ("contracts",    "language",    "TEXT"),
             ("risk_clauses", "page_number", "INTEGER"),
             ("risk_clauses", "text_snippet","TEXT"),
             ("obligations",  "section_ref", "TEXT"),
@@ -190,10 +192,19 @@ def seed_users(db: Session):
 # ─────────────────────────────────────────────────────────────
 # AI Extraction
 # ─────────────────────────────────────────────────────────────
-EXTRACTION_PROMPT = """You are a contract analysis AI. The contract text below has [PAGE N] markers indicating page breaks. Extract information and return ONLY valid JSON — no markdown, no code fences, no extra text.
+EXTRACTION_PROMPT = """You are a contract analysis AI. The contract text below has [PAGE N] markers indicating page breaks. The contract may be written in any language (English, Arabic, French, etc.).
+
+IMPORTANT LANGUAGE RULES:
+- Detect the contract's primary language and set the "language" field ("en", "ar", "fr", etc.)
+- Write ALL output fields (titles, descriptions, summaries, section_ref, plain_english_summary) in THE SAME LANGUAGE as the contract. If the contract is in Arabic, all output must be in Arabic. If it is in English, all output must be in English.
+- If dates use the Hijri (Islamic) calendar, convert them to Gregorian YYYY-MM-DD
+- For section references: use the exact section identifier as it appears in the contract (e.g. "المادة ٥ — السرية" for Arabic, "§ 5.1 — Confidentiality" for English)
+
+Return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this structure:
 {
+  "language": "en" | "ar" | "fr" | "de" | <ISO 639-1 code>,
   "contract_type": "SaaS" | "NDA" | "MSA" | "Employment" | "Services" | "Data" | "Cloud" | "Other",
   "parties": ["Party 1", "Party 2"],
   "effective_date": "YYYY-MM-DD or null",
@@ -202,29 +213,29 @@ Return exactly this structure:
   "auto_renewal_notice_days": number or null,
   "auto_renewal_term_years": number or null,
   "total_value": number or null,
-  "currency": "USD" | "GBP" | "EUR" | null,
-  "governing_law": "jurisdiction string or null",
-  "plain_english_summary": "Write 2-3 paragraphs in plain English: (1) what this contract does and key terms, (2) what is most concerning or risky, (3) what the reader should do now. Use **bold** for critical items. No legal jargon.",
+  "currency": "USD" | "GBP" | "EUR" | "SAR" | "AED" | "KWD" | "QAR" | "OMR" | "BHD" | "EGP" | null,
+  "governing_law": "jurisdiction string — in the contract's language",
+  "plain_english_summary": "Write 2-3 paragraphs in the CONTRACT'S LANGUAGE: (1) what this contract does and key terms, (2) what is most concerning or risky, (3) what the reader should do now. Use **bold** for critical items. No legal jargon.",
   "risk_clauses": [
     {
       "type": "liability_cap" | "ip_ownership" | "auto_renewal" | "price_change" | "termination" | "indemnification" | "audit_rights" | "data_ownership" | "non_compete" | "sla_penalty",
       "severity": "critical" | "high" | "medium" | "low",
-      "title": "Short descriptive title (6 words max)",
-      "description": "1-2 sentences explaining the risk in plain English",
-      "section_ref": "§ X.Y — Section Name",
+      "title": "Short descriptive title in the CONTRACT'S LANGUAGE (6 words max)",
+      "description": "1-2 sentences explaining the risk in the CONTRACT'S LANGUAGE",
+      "section_ref": "exact section identifier as it appears in the contract",
       "page_number": <integer page number from [PAGE N] marker where this clause appears, or 1 if unknown>,
       "text_snippet": "<exact quoted phrase of 15-25 words from the contract text that contains this clause>"
     }
   ],
   "obligations": [
     {
-      "title": "Short obligation title",
-      "description": "What specifically must be done",
-      "due_date": "YYYY-MM-DD or null",
+      "title": "Short obligation title in the CONTRACT'S LANGUAGE",
+      "description": "What specifically must be done, in the CONTRACT'S LANGUAGE",
+      "due_date": "YYYY-MM-DD or null (convert Hijri to Gregorian)",
       "frequency": "one_time" | "monthly" | "quarterly" | "annual" | "event_based",
       "owner_team": "Legal" | "Finance" | "IT" | "Procurement" | "Operations" | "HR",
       "trigger_type": "time_based" | "event_based",
-      "section_ref": "§ X.Y — Section Name (the contract section that creates this obligation)",
+      "section_ref": "exact section identifier as it appears in the contract",
       "page_number": <integer page number from [PAGE N] marker where this obligation appears, or 1 if unknown>,
       "text_snippet": "<exact quoted phrase of 15-25 words from the contract text that creates this obligation>"
     }
@@ -260,14 +271,81 @@ def parse_claude_json(text: str) -> dict:
         raise
 
 
+def detect_language(text: str) -> str:
+    """Detect primary language from text using Unicode character ranges."""
+    if not text:
+        return "en"
+    arabic_chars = sum(1 for c in text if '\u0600' <= c <= '\u06FF')
+    total_alpha   = sum(1 for c in text if c.isalpha())
+    if total_alpha == 0:
+        return "en"
+    return "ar" if (arabic_chars / total_alpha) > 0.3 else "en"
+
+
 def extract_text_with_pages(contents: bytes) -> str:
-    """Extract text from PDF with [PAGE N] markers for each page."""
-    with pdfplumber.open(io.BytesIO(contents)) as pdf:
+    """Extract text from PDF with [PAGE N] markers.
+
+    Strategy (in order):
+    1. PyMuPDF  — best Arabic/RTL support, correct glyph ordering
+    2. pdfplumber — fallback for Latin-script PDFs
+    3. pytesseract OCR — optional fallback for scanned/image-only PDFs
+    """
+    # ── 1. PyMuPDF ──────────────────────────────────────────────
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=contents, filetype="pdf")
         parts = []
-        for i, page in enumerate(pdf.pages, 1):
-            page_text = page.extract_text() or ""
+        total_chars = 0
+        for i, page in enumerate(doc, 1):
+            page_text = page.get_text(
+                "text",
+                flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE,
+            )
+            total_chars += len(page_text.strip())
             parts.append(f"[PAGE {i}]\n{page_text}")
-        return "\n\n".join(parts)
+        doc.close()
+        avg = total_chars / max(len(parts), 1)
+        if avg > 50:          # real text layer
+            return "\n\n".join(parts)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # ── 2. pdfplumber ────────────────────────────────────────────
+    try:
+        with pdfplumber.open(io.BytesIO(contents)) as pdf:
+            parts = []
+            total_chars = 0
+            for i, page in enumerate(pdf.pages, 1):
+                page_text = page.extract_text() or ""
+                total_chars += len(page_text.strip())
+                parts.append(f"[PAGE {i}]\n{page_text}")
+            avg = total_chars / max(len(parts), 1)
+            if avg > 50:
+                return "\n\n".join(parts)
+    except Exception:
+        pass
+
+    # ── 3. OCR fallback (Tesseract + Arabic language pack) ───────
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+        images = convert_from_bytes(contents, dpi=200)
+        parts = []
+        for i, img in enumerate(images, 1):
+            # Detect Arabic vs English OCR language per page dynamically below
+            text = pytesseract.image_to_string(img, lang="ara+eng")
+            parts.append(f"[PAGE {i}]\n{text}")
+        result = "\n\n".join(parts)
+        if result.strip():
+            return result
+    except ImportError:
+        pass   # pytesseract / pdf2image not installed — skip silently
+    except Exception:
+        pass
+
+    return ""
 
 
 def extract_with_claude(tagged_text: str) -> dict:
@@ -354,6 +432,7 @@ def contract_to_dict(c: Contract) -> dict:
         "currency": c.currency,
         "governing_law": c.governing_law,
         "plain_english_summary": c.plain_english_summary,
+        "language": c.language or "en",
         "has_pdf": bool(c.pdf_path and os.path.exists(c.pdf_path)),
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "risk_clauses": [
@@ -492,6 +571,10 @@ async def upload_contract(file: UploadFile = File(...), db: Session = Depends(ge
         contract.pdf_path = pdf_path
         db.commit()
 
+    # Detect language from extracted text
+    contract.language = detect_language(tagged_text)
+    db.commit()
+
     # Extract with Claude
     try:
         data = extract_with_claude(tagged_text)
@@ -502,6 +585,7 @@ async def upload_contract(file: UploadFile = File(...), db: Session = Depends(ge
 
     # Persist extracted data
     contract.status            = "completed"
+    contract.language          = data.get("language") or contract.language or "en"
     contract.contract_type     = data.get("contract_type")
     contract.parties           = data.get("parties", [])
     contract.effective_date    = data.get("effective_date")

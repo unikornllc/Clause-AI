@@ -13,41 +13,70 @@ const STOPWORDS = new Set([
   'from', 'by', 'on', 'at', 'as', 'is', 'are', 'its', 'any', 'all',
 ])
 
+// Arabic stopwords (articles, prepositions, conjunctions)
+const ARABIC_STOPWORDS = new Set([
+  'في', 'من', 'إلى', 'على', 'عن', 'مع', 'أو', 'و', 'ال', 'هذا', 'هذه',
+  'التي', 'الذي', 'كل', 'أي', 'لا', 'ما', 'أن', 'إن', 'كان', 'يكون',
+])
+
+function isArabicText(str) {
+  return /[\u0600-\u06FF]/.test(str)
+}
+
 /**
- * Pull key tokens out of a section_ref string like "§ 14.1 — Term and Renewal"
- * Returns { number: "14.1", words: ["term", "renewal"] }
+ * Parse a section_ref into tokens for page matching.
+ * Handles both English ("§ 14.1 — Term and Renewal") and
+ * Arabic ("Art. 5 — Confidentiality (المادة ٥ — السرية)") refs.
+ * Returns { number, words, arabicWords, isArabic }
  */
 function parseSectionRef(sectionRef) {
-  if (!sectionRef) return { number: null, words: [] }
+  if (!sectionRef) return { number: null, words: [], arabicWords: [], isArabic: false }
 
-  // Extract section number: "14.1", "8", "6.2.3", etc.
-  const numMatch = sectionRef.match(/\b(\d+(?:\.\d+)*)\b/)
+  const hasArabic = isArabicText(sectionRef)
+
+  // Extract Western digits and Arabic-Indic digits (٠١٢٣٤٥٦٧٨٩)
+  const numMatch = sectionRef.match(/\b(\d+(?:\.\d+)*)\b/) ||
+                   sectionRef.match(/([٠-٩]+(?:\.[٠-٩]+)*)/)
   const number = numMatch ? numMatch[1] : null
 
-  // Strip punctuation/symbols and extract meaningful words
+  // English words
   const words = sectionRef
-    .replace(/[§—·.]/g, ' ')
+    .replace(/[§—·.()\u0600-\u06FF]/g, ' ')
     .split(/\s+/)
     .map(w => w.toLowerCase().replace(/[^a-z]/g, ''))
     .filter(w => w.length > 3 && !STOPWORDS.has(w) && !/^\d+$/.test(w))
 
-  return { number, words }
+  // Arabic words
+  const arabicWords = hasArabic
+    ? sectionRef
+        .replace(/[§—·.()\d٠-٩]/g, ' ')
+        .split(/\s+/)
+        .map(w => w.trim())
+        .filter(w => w.length > 2 && isArabicText(w) && !ARABIC_STOPWORDS.has(w))
+    : []
+
+  return { number, words, arabicWords, isArabic: hasArabic }
 }
 
 /**
  * Score a page's text content against section tokens.
- * Higher score = better match.
+ * Works for both English and Arabic.
  */
 function scorePage(pageText, tokens) {
   let score = 0
+
+  // Section number match (strongest signal — language-independent)
+  if (tokens.number && pageText.includes(tokens.number)) score += 20
+
+  // English title word matches
   const lower = pageText.toLowerCase()
-
-  // Section number match is the strongest signal
-  if (tokens.number && lower.includes(tokens.number)) score += 20
-
-  // Title word matches
   for (const word of tokens.words) {
     if (lower.includes(word)) score += 2
+  }
+
+  // Arabic word matches (direct string match — no lowercasing needed)
+  for (const word of tokens.arabicWords) {
+    if (pageText.includes(word)) score += 2
   }
 
   return score
@@ -131,17 +160,20 @@ export default function PdfViewer({ contractId, sectionRef, fallbackPage }) {
     const s = str.trim()
     if (!s) return str
 
-    const sLower = s.toLowerCase()
-
-    // Strong match: span contains the section number (e.g. "14.1")
-    if (tokens.number && sLower.includes(tokens.number)) {
+    // Strong match: section number (works for both scripts)
+    if (tokens.number && str.includes(tokens.number)) {
       return `<mark class="pdf-highlight">${str}</mark>`
     }
 
-    // Medium match: span contains 2+ distinct title words
-    const matchCount = tokens.words.filter(w => sLower.includes(w)).length
-    if (matchCount >= 2) {
-      return `<mark class="pdf-highlight">${str}</mark>`
+    if (tokens.isArabic) {
+      // Arabic: match against Arabic words directly
+      const matchCount = tokens.arabicWords.filter(w => str.includes(w)).length
+      if (matchCount >= 2) return `<mark class="pdf-highlight">${str}</mark>`
+    } else {
+      // English: case-insensitive word matching
+      const sLower = s.toLowerCase()
+      const matchCount = tokens.words.filter(w => sLower.includes(w)).length
+      if (matchCount >= 2) return `<mark class="pdf-highlight">${str}</mark>`
     }
 
     return str
