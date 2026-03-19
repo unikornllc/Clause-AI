@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,
     Float, Text, DateTime, ForeignKey, text,
@@ -26,11 +27,12 @@ load_dotenv()
 # Database
 # ─────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+UPLOADS_DIR = os.environ.get("UPLOAD_DIR", os.path.join(BASE_DIR, "uploads"))
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
+_default_db = f"sqlite:///{os.path.join(BASE_DIR, 'contracts.db')}"
 engine = create_engine(
-    f"sqlite:///{os.path.join(BASE_DIR, 'contracts.db')}",
+    os.environ.get("DATABASE_URL", _default_db),
     connect_args={"check_same_thread": False},
 )
 SessionLocal = sessionmaker(bind=engine)
@@ -1199,3 +1201,15 @@ def seed_database(db: Session):
         for ob in seed.get("obligations", []):
             db.add(Obligation(contract_id=c.id, **ob))
         db.commit()
+
+
+# ─────────────────────────────────────────────────────────────
+# Serve built frontend (production)
+# ─────────────────────────────────────────────────────────────
+FRONTEND_DIST = os.environ.get("FRONTEND_DIST", os.path.join(BASE_DIR, "..", "frontend", "dist"))
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_spa(full_path: str):
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
