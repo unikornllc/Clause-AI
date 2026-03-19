@@ -1,0 +1,203 @@
+
+/* ── Contract Library ── */
+.library-layout {
+  display: flex; flex: 1; overflow: hidden; height: 100%;
+}
+
+/* Left sidebar */
+.library-sidebar {
+  width: 264px; min-width: 264px; border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden; background: var(--bg-raised);
+}
+.library-search-wrap { padding: 12px 12px 8px; }
+.library-search {
+  width: 100%; height: 32px; padding: 0 10px; border-radius: 7px;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text); font-size: 12px; font-family: inherit; outline: none;
+}
+.library-search:focus { border-color: var(--gold); }
+
+.library-type-filters {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 0 12px 8px;
+}
+.lib-type-chip {
+  padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 500;
+  border: 1px solid var(--border); background: none; cursor: pointer;
+  color: var(--text-3); font-family: inherit; transition: all 0.12s;
+}
+.lib-type-chip:hover  { border-color: var(--gold); color: var(--text); }
+.lib-type-chip.active { background: var(--gold); color: #fff; border-color: var(--gold); }
+
+.library-compare-toggle {
+  padding: 0 12px 10px; display: flex; align-items: center; gap: 8px;
+}
+.lib-compare-toggle-btn {
+  padding: 5px 12px; border-radius: 7px; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--border); background: none; cursor: pointer;
+  color: var(--text-2); font-family: inherit; transition: all 0.12s;
+}
+.lib-compare-toggle-btn:hover  { border-color: var(--gold); color: var(--text); }
+.lib-compare-toggle-btn.active { background: var(--gold-dim); border-color: var(--gold); color: var(--gold); }
+
+.library-list { flex: 1; overflow-y: auto; padding: 4px 8px 12px; }
+
+/* Contract card in list */
+.lib-card {
+  padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+  margin-bottom: 6px; cursor: pointer; background: var(--surface);
+  transition: border-color 0.13s, background 0.13s;
+}
+.lib-card:hover      { border-color: var(--gold); background: rgba(108,71,255,0.03); }
+.lib-card-active     { border-color: var(--gold) !important; background: rgba(108,71,255,0.06) !important; }
+.lib-card-header     { display: flex; gap: 6px; align-items: center; margin-bottom: 5px; }
+.lib-card-name       { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 5px; line-height: 1.4; }
+.lib-card-meta       { display: flex; gap: 8px; font-size: 11px; color: var(--text-3); flex-wrap: wrap; }
+.lib-type-badge {
+  font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px;
+  background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border);
+}
+.lib-pdf-badge {
+  font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px;
+  background: var(--gold-dim); color: var(--gold);
+}
+.lib-compare-btn {
+  margin-top: 8px; width: 100%; padding: 4px; border-radius: 5px; font-size: 11px;
+  font-weight: 500; border: 1px dashed var(--border); background: none;
+  cursor: pointer; color: var(--text-3); font-family: inherit; transition: all 0.12s;
+}
+.lib-compare-btn:hover  { border-color: var(--gold); color: var(--gold); }
+.lib-compare-btn.active { border-style: solid; border-color: var(--gold); background: var(--gold-dim); color: var(--gold); font-weight: 600; }
+
+/* Main area */
+.library-main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.lib-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; color: var(--text-3);
+}
+
+/* Single contract detail */
+.lib-detail { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.lib-detail-header {
+  padding: 14px 20px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.lib-detail-name { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.lib-detail-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); align-items: center; }
+
+.lib-detail-body  { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+
+/* Clauses panel (left of PDF) */
+.lib-clauses-panel {
+  width: 320px; min-width: 280px; border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0;
+}
+.lib-tabs { display: flex; align-items: center; gap: 2px; padding: 8px 10px 0; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+.lib-tab {
+  padding: 5px 11px; border-radius: 6px; font-size: 11px; font-weight: 500;
+  border: 1px solid transparent; background: none;
+  cursor: pointer; color: var(--text-3); font-family: inherit; transition: all 0.1s;
+}
+.lib-tab:hover  { color: var(--text); }
+.lib-tab.active { background: var(--gold-dim); color: var(--gold); border-color: var(--border); font-weight: 600; }
+.lib-pdf-hint   { font-size: 10px; color: var(--text-3); margin-left: 4px; white-space: nowrap; }
+.lib-clauses-scroll { flex: 1; overflow-y: auto; }
+
+/* Individual clause/obligation row */
+.lib-clause-item {
+  padding: 9px 12px; border-bottom: 1px solid var(--border); transition: background 0.1s;
+}
+.lib-clause-item.clickable { cursor: pointer; }
+.lib-clause-item.clickable:hover { background: var(--bg-raised); }
+.lib-clause-item.active { background: rgba(108,71,255,0.07); border-left: 3px solid var(--gold); }
+.lib-clause-row   { display: flex; gap: 8px; align-items: flex-start; }
+.lib-clause-kind-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+.lib-clause-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 2px; }
+.lib-clause-desc  { font-size: 11px; color: var(--text-2); line-height: 1.5; }
+.lib-clause-ref   { font-size: 10px; color: var(--text-3); margin-top: 3px; font-family: 'JetBrains Mono', monospace; }
+
+/* PDF panel */
+.lib-pdf-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.lib-pdf-label {
+  padding: 10px 14px 8px; font-size: 11px; font-weight: 600; color: var(--text-2);
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+
+.lib-no-pdf {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; color: var(--text-3); padding: 20px;
+}
+
+/* Compare view */
+.lib-compare { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.lib-compare-tabs {
+  display: flex; align-items: center; gap: 4px; padding: 8px 14px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+
+/* Aligned risk comparison table */
+.lib-compare-table { flex-shrink: 0; overflow-y: auto; max-height: 42%; border-bottom: 2px solid var(--border); }
+.lib-compare-thead {
+  display: flex; position: sticky; top: 0; background: var(--bg-raised);
+  border-bottom: 1px solid var(--border); z-index: 1;
+}
+.lib-compare-row   { display: flex; border-bottom: 1px solid var(--border); }
+.lib-compare-row:last-child { border-bottom: none; }
+.lib-compare-label-col {
+  width: 130px; min-width: 130px; padding: 8px 12px; border-right: 1px solid var(--border);
+  display: flex; align-items: center; background: var(--bg-raised); flex-shrink: 0;
+}
+.lib-compare-contract-col {
+  flex: 1; padding: 8px 12px; font-size: 11px; font-weight: 700; color: var(--text);
+  border-right: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.lib-compare-contract-col:last-child { border-right: none; }
+.lib-compare-cell {
+  flex: 1; padding: 8px 12px; border-right: 1px solid var(--border); min-height: 44px;
+  transition: background 0.1s;
+}
+.lib-compare-cell:last-child  { border-right: none; }
+.lib-compare-cell.clickable   { cursor: pointer; }
+.lib-compare-cell.clickable:hover { background: var(--bg-raised); }
+.lib-compare-cell.active      { background: rgba(108,71,255,0.07); }
+
+/* Obligations side-by-side */
+.lib-compare-obl { display: flex; overflow: hidden; max-height: 42%; border-bottom: 2px solid var(--border); }
+.lib-compare-obl-col { flex: 1; overflow-y: auto; }
+.lib-compare-obl-header {
+  padding: 8px 12px; font-size: 11px; font-weight: 700; color: var(--text);
+  background: var(--bg-raised); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* PDF viewers at bottom of compare view */
+.lib-compare-pdfs {
+  flex: 1; display: flex; overflow: hidden; min-height: 0;
+}
+.lib-compare-pdf-col {
+  flex: 1; overflow: hidden; display: flex; flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+.lib-compare-pdf-col:last-child { border-right: none; }
+
+/* ── PDF viewer overrides inside Library containers ──
+   The default .pdf-document-wrap has max-height: 680px which clips
+   the PDF in flex-column containers. Override it to fill + scroll
+   within the actual available height instead. */
+
+/* Compare mode: each PDF column */
+.lib-compare-pdf-col .pdf-viewer-wrap {
+  flex: 1; display: flex; flex-direction: column;
+  overflow: hidden; border-radius: 0; border: none;
+}
+.lib-compare-pdf-col .pdf-document-wrap {
+  flex: 1; overflow-y: auto; max-height: none;
+}
+
+/* Single detail view: PDF panel */
+.lib-pdf-panel .pdf-viewer-wrap {
+  flex: 1; display: flex; flex-direction: column;
+  overflow: hidden; border-radius: 0; border: none; border-top: none;
+}
+.lib-pdf-panel .pdf-document-wrap {
+  flex: 1; overflow-y: auto; max-height: none;
+}

@@ -24,9 +24,17 @@ function isArabicText(str) {
 }
 
 /**
+ * Convert Arabic-Indic digits (٠١٢٣٤٥٦٧٨٩) to Western digits (0-9).
+ * This lets us match section numbers regardless of which digit form is used
+ * in the contract or the PDF text layer.
+ */
+function normalizeDigits(str) {
+  return str.replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+}
+
+/**
  * Parse a section_ref into tokens for page matching.
- * Handles both English ("§ 14.1 — Term and Renewal") and
- * Arabic ("Art. 5 — Confidentiality (المادة ٥ — السرية)") refs.
+ * Handles English ("§ 14.1 — Term and Renewal") and Arabic ("المادة ٥ — السرية").
  * Returns { number, words, arabicWords, isArabic }
  */
 function parseSectionRef(sectionRef) {
@@ -34,19 +42,19 @@ function parseSectionRef(sectionRef) {
 
   const hasArabic = isArabicText(sectionRef)
 
-  // Extract Western digits and Arabic-Indic digits (٠١٢٣٤٥٦٧٨٩)
-  const numMatch = sectionRef.match(/\b(\d+(?:\.\d+)*)\b/) ||
-                   sectionRef.match(/([٠-٩]+(?:\.[٠-٩]+)*)/)
-  const number = numMatch ? numMatch[1] : null
+  // Normalize Arabic-Indic digits before extracting the section number
+  const normalized = normalizeDigits(sectionRef)
+  const numMatch   = normalized.match(/\b(\d+(?:\.\d+)*)\b/)
+  const number     = numMatch ? numMatch[1] : null
 
-  // English words
+  // English words (strip Arabic chars + punctuation first)
   const words = sectionRef
     .replace(/[§—·.()\u0600-\u06FF]/g, ' ')
     .split(/\s+/)
     .map(w => w.toLowerCase().replace(/[^a-z]/g, ''))
     .filter(w => w.length > 3 && !STOPWORDS.has(w) && !/^\d+$/.test(w))
 
-  // Arabic words
+  // Arabic words (strip digits + punctuation)
   const arabicWords = hasArabic
     ? sectionRef
         .replace(/[§—·.()\d٠-٩]/g, ' ')
@@ -60,64 +68,78 @@ function parseSectionRef(sectionRef) {
 
 /**
  * Score a page's text content against section tokens.
- * Works for both English and Arabic.
+ * Normalizes Arabic-Indic digits in page text before number comparison.
  */
 function scorePage(pageText, tokens) {
   let score = 0
 
-  // Section number match (strongest signal — language-independent)
-  if (tokens.number && pageText.includes(tokens.number)) score += 20
+  // Normalize page text digits for number comparison
+  const normalizedPage = normalizeDigits(pageText)
 
-  // English title word matches
-  const lower = pageText.toLowerCase()
+  // Section number match — strongest signal, language-independent
+  if (tokens.number && normalizedPage.includes(tokens.number)) score += 20
+
+  // English title word matches (case-insensitive)
+  const lowerPage = pageText.toLowerCase()
   for (const word of tokens.words) {
-    if (lower.includes(word)) score += 2
+    if (lowerPage.includes(word)) score += 2
   }
 
-  // Arabic word matches (direct string match — no lowercasing needed)
+  // Arabic word matches (direct — Arabic is case-invariant)
   for (const word of tokens.arabicWords) {
-    if (pageText.includes(word)) score += 2
+    if (pageText.includes(word)) score += 3  // slightly higher weight for Arabic words
   }
 
   return score
 }
 
 /**
- * Use pdfjs to load the document text and find the page that best matches
- * the section_ref. Returns the 1-based page number, or null if not found.
+ * Given a known page number, confirm the section is there by scoring
+ * just that page. If the score is too low, try the one page before and
+ * after (Claude's page numbers can be off by ±1 due to cover pages).
+ * Returns the best matching page number among the candidates.
  */
-async function findSectionPage(contractId, sectionRef) {
+async function findSectionPage(contractId, sectionRef, knownPage) {
   const tokens = parseSectionRef(sectionRef)
-  if (!tokens.number && tokens.words.length === 0) return null
+  // If we have no tokens to match on, just trust the saved page number
+  if (!tokens.number && tokens.words.length === 0 && tokens.arabicWords.length === 0) {
+    return knownPage || null
+  }
 
   const url = `/api/contracts/${contractId}/pdf`
   let pdfDoc
   try {
     pdfDoc = await pdfjs.getDocument(url).promise
   } catch {
-    return null
+    return knownPage || null
   }
 
-  let bestPage = null
-  let bestScore = 0
+  const totalPages = pdfDoc.numPages
 
-  for (let i = 1; i <= pdfDoc.numPages; i++) {
+  // Candidate pages: saved page ± 1 (handles off-by-one from cover pages)
+  const base = knownPage || 1
+  const candidates = [...new Set([base, base - 1, base + 1])]
+    .filter(p => p >= 1 && p <= totalPages)
+
+  let bestPage  = base   // default to the saved page number
+  let bestScore = -1
+
+  for (const pageNum of candidates) {
     try {
-      const page = await pdfDoc.getPage(i)
+      const page    = await pdfDoc.getPage(pageNum)
       const content = await page.getTextContent()
       const pageText = content.items.map(item => item.str).join(' ')
-      const score = scorePage(pageText, tokens)
+      const score   = scorePage(pageText, tokens)
       if (score > bestScore) {
         bestScore = score
-        bestPage = i
+        bestPage  = pageNum
       }
     } catch {
       // skip unreadable page
     }
   }
 
-  // Only return if we found something meaningful
-  return bestScore >= 20 ? bestPage : null
+  return bestPage
 }
 
 export default function PdfViewer({ contractId, sectionRef, fallbackPage }) {
@@ -127,19 +149,25 @@ export default function PdfViewer({ contractId, sectionRef, fallbackPage }) {
   const [searching, setSearching]   = useState(false)
   const containerRef = useRef(null)
 
-  // When sectionRef changes: search for the correct page in the PDF text
+  // When sectionRef/fallbackPage changes: jump to the saved page, then
+  // confirm/refine within the ±1 window using section text matching.
   useEffect(() => {
-    if (!sectionRef || !contractId) {
-      if (fallbackPage) setPageNum(fallbackPage)
+    if (!contractId) return
+
+    if (!sectionRef) {
+      setPageNum(fallbackPage || 1)
       return
     }
 
+    // Show the saved page immediately so the user isn't waiting on a blank screen
+    if (fallbackPage) setPageNum(fallbackPage)
     setSearching(true)
-    findSectionPage(contractId, sectionRef).then(found => {
+
+    findSectionPage(contractId, sectionRef, fallbackPage).then(found => {
       setPageNum(found || fallbackPage || 1)
       setSearching(false)
     })
-  }, [sectionRef, contractId])
+  }, [sectionRef, fallbackPage, contractId])
 
   // Responsive width
   useEffect(() => {
@@ -160,8 +188,8 @@ export default function PdfViewer({ contractId, sectionRef, fallbackPage }) {
     const s = str.trim()
     if (!s) return str
 
-    // Strong match: section number (works for both scripts)
-    if (tokens.number && str.includes(tokens.number)) {
+    // Strong match: section number — normalize digits on both sides
+    if (tokens.number && normalizeDigits(str).includes(tokens.number)) {
       return `<mark class="pdf-highlight">${str}</mark>`
     }
 

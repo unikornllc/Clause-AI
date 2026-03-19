@@ -92,7 +92,6 @@ function DrillPanel({ clauseKey, clauseLabel, contracts, focusId, onClose, navig
             <div
               key={contract.id}
               ref={isFocused ? focusRef : null}
-              onClick={() => navigate('brief', contract.id, clauseKey)}
               style={{
                 margin: '0 12px 8px',
                 padding: '12px 14px',
@@ -103,22 +102,15 @@ function DrillPanel({ clauseKey, clauseLabel, contracts, focusId, onClose, navig
                 background: isFocused
                   ? 'rgba(108,71,255,0.04)'
                   : 'var(--surface)',
-                cursor: 'pointer',
-                transition: 'border-color 0.13s, background 0.13s',
-              }}
-              onMouseEnter={e => {
-                e.currentTarget.style.borderColor = 'var(--gold)'
-                e.currentTarget.style.background = 'rgba(108,71,255,0.04)'
-              }}
-              onMouseLeave={e => {
-                e.currentTarget.style.borderColor = isFocused ? 'var(--gold)' : 'var(--border)'
-                e.currentTarget.style.background = isFocused ? 'rgba(108,71,255,0.04)' : 'var(--surface)'
               }}
             >
-              {/* Contract name + severity + navigate hint */}
+              {/* Contract name + severity */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: cell ? 8 : 0 }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
+                  <span
+                    style={{ fontSize: 12, fontWeight: 700, color: 'var(--gold)', cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: 2 }}
+                    onClick={() => navigate('brief', contract.id, clauseKey)}
+                  >
                     {contract.name}
                   </span>
                   {contract.counterparty && (
@@ -139,7 +131,6 @@ function DrillPanel({ clauseKey, clauseLabel, contracts, focusId, onClose, navig
                 {!cell && (
                   <span style={{ fontSize: 10, color: 'var(--text-3)', fontStyle: 'italic' }}>absent</span>
                 )}
-                <span style={{ fontSize: 11, color: 'var(--gold)', flexShrink: 0 }}>→</span>
               </div>
 
               {cell ? (
@@ -272,9 +263,13 @@ export default function RiskMap({ navigate }) {
             </thead>
             <tbody>
               {contracts.map(c => (
-                <tr key={c.id} style={{ cursor: 'pointer' }} onClick={() => navigate('brief', c.id)}>
+                <tr key={c.id}>
                   <td>
-                    <div className="hm-vendor">{c.name}</div>
+                    <div
+                      className="hm-vendor"
+                      style={{ cursor: 'pointer', color: 'var(--gold)', textDecoration: 'underline', textUnderlineOffset: 2 }}
+                      onClick={() => navigate('brief', c.id)}
+                    >{c.name}</div>
                     <div className="hm-value">{fmt(c.total_value) || '—'}</div>
                   </td>
                   {CLAUSE_COLS.map(col => {
@@ -346,15 +341,17 @@ export default function RiskMap({ navigate }) {
                 {allRisks.map((r, i) => (
                   <div
                     key={i}
-                    style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '9px 10px', background: 'var(--bg-raised)', border: '1px solid var(--border)', borderRadius: 7, cursor: 'pointer' }}
-                    onClick={() => navigate('brief', r.contract_id)}
+                    style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '9px 10px', background: 'var(--bg-raised)', border: '1px solid var(--border)', borderRadius: 7 }}
                   >
                     <span className={`risk-pill ${r.severity}`} style={{ fontSize: 10, flexShrink: 0 }}>
                       {r.severity}
                     </span>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{r.title}</div>
-                      <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>{r.contract_name}</div>
+                      <div
+                        style={{ fontSize: 11, color: 'var(--gold)', marginTop: 2, cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: 2 }}
+                        onClick={() => navigate('brief', r.contract_id)}
+                      >{r.contract_name}</div>
                     </div>
                   </div>
                 ))}

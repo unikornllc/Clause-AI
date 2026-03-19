@@ -2,6 +2,7 @@ const NAV = [
   { id: 'dashboard',   label: 'Dashboard',         icon: '⬛', section: 'Overview' },
   { id: 'exec',        label: 'Executive View',    icon: '📊', section: null },
   { id: 'upload',      label: 'Upload Contract',   icon: '⬆', section: 'Contracts' },
+  { id: 'library',     label: 'Contract Library',  icon: '📚', section: null },
   { id: 'brief',       label: 'Contract Brief',    icon: '📄', section: null },
   { id: 'search',      label: 'Ask Anything',      icon: '💬', section: 'Intelligence' },
   { id: 'risk',        label: 'Risk Map',          icon: '🔥', section: null },
