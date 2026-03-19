@@ -38,4 +38,6 @@ export const api = {
   getObligations:     ()                    => request('GET',    '/api/obligations'),
   completeObligation: (id)                  => request('PUT',    `/api/obligations/${id}/complete`),
   getStats:           ()                    => request('GET',    '/api/stats'),
+  getNegotiation:     (id) => request('GET',  `/api/negotiations/${id}`),
+  analyzeNegotiation: (id) => request('POST', `/api/negotiations/${id}/analyze`),
 }

@@ -121,6 +121,16 @@ class UserSession(Base):
     user       = relationship("User", back_populates="sessions")
 
 
+class NegotiationAnalysis(Base):
+    __tablename__ = "negotiation_analyses"
+    id             = Column(Integer, primary_key=True)
+    contract_id    = Column(Integer, ForeignKey("contracts.id"), unique=True)
+    analysis       = Column(SAJson, nullable=False)   # full structured result
+    portfolio_hash = Column(String, nullable=False)   # hash of portfolio at analysis time
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    contract       = relationship("Contract")
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -361,6 +371,19 @@ def extract_with_claude(tagged_text: str) -> dict:
     return parse_claude_json(msg.content[0].text)
 
 
+def compute_portfolio_hash(db: Session, exclude_id: int) -> str:
+    """Hash of the completed portfolio (excluding target) to detect staleness."""
+    contracts = db.query(Contract).filter(
+        Contract.status == "completed",
+        Contract.id != exclude_id
+    ).order_by(Contract.id).all()
+    parts = [
+        f"{c.id}:{','.join(sorted(r.type for r in c.risk_clauses))}"
+        for c in contracts
+    ]
+    return hashlib.md5("|".join(parts).encode()).hexdigest()
+
+
 def search_with_claude(question: str, contracts: list) -> dict:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -403,6 +426,89 @@ def search_with_claude(question: str, contracts: list) -> dict:
         f"Contracts:\n{context}\n\n"
         f"Question: {question}"
     )
+
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return parse_claude_json(msg.content[0].text)
+
+
+def analyze_for_negotiations(target: dict, portfolio: list) -> dict:
+    """Compare target contract clauses against the rest of the portfolio."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set")
+
+    def fmt_val(v):
+        if not v: return "N/A"
+        if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
+        if v >= 1_000: return f"${int(v/1000)}k"
+        return f"${int(v)}"
+
+    # Build target summary
+    target_clauses = "\n".join(
+        f"  - [{r['severity'].upper()}] {r['type']}: {r['title']} — {r['description']} ({r['section_ref'] or 'no ref'})"
+        for r in target.get("risk_clauses", [])
+    )
+    target_block = (
+        f"TARGET CONTRACT: {target['name']}\n"
+        f"Type: {target['contract_type']} | Value: {fmt_val(target.get('total_value'))} {target.get('currency','')}\n"
+        f"Parties: {', '.join(target.get('parties') or [])}\n"
+        f"Expiry: {target.get('expiration_date','N/A')} | Auto-renewal: {'Yes, ' + str(target['auto_renewal_notice_days']) + 'd notice' if target.get('auto_renewal') else 'No'}\n"
+        f"Governing law: {target.get('governing_law','N/A')}\n"
+        f"Clauses:\n{target_clauses or '  None identified'}"
+    )
+
+    # Build portfolio summary
+    portfolio_parts = []
+    for c in portfolio:
+        clauses = "\n".join(
+            f"    - {r['type']}: {r['title']} — {r['description'][:200]}"
+            for r in c.get("risk_clauses", [])
+        )
+        portfolio_parts.append(
+            f"  Contract: {c['name']} (Type: {c['contract_type']}, Value: {fmt_val(c.get('total_value'))})\n"
+            f"  Auto-renewal: {'Yes, ' + str(c['auto_renewal_notice_days']) + 'd' if c.get('auto_renewal') else 'No'} | "
+            f"Governing law: {c.get('governing_law','N/A')}\n"
+            f"  Clauses:\n{clauses or '    None'}"
+        )
+    portfolio_block = "PORTFOLIO CONTRACTS (for benchmarking):\n" + "\n\n".join(portfolio_parts)
+
+    prompt = f"""You are a contract negotiation intelligence assistant for a legal/procurement team.
+
+Analyse the TARGET CONTRACT and compare each of its key clauses against the PORTFOLIO CONTRACTS.
+For each clause type, identify whether the target's terms are unfavourable, average, or favourable compared to the portfolio, and generate a specific negotiation talking point that cites real portfolio data.
+
+Return ONLY valid JSON (no markdown, no code fences):
+{{
+  "overall_position": "2-3 sentence summary of negotiation position and key risks",
+  "leverage_score": <integer 1-5, where 5 = strong leverage / many unfavourable terms to push back on>,
+  "clauses": [
+    {{
+      "type": "<clause type string>",
+      "label": "<human-readable label>",
+      "your_position": "<what this contract says, concisely>",
+      "portfolio_benchmark": "<what comparable portfolio contracts say, with specifics e.g. 'avg $380k across 3 SaaS contracts'>",
+      "benchmark_rating": "below_average | average | above_average | no_data",
+      "talking_point": "<specific negotiation talking point citing portfolio data, 1-2 sentences>",
+      "suggested_ask": "<concrete ask for the negotiation, e.g. 'Raise liability cap to $380k'>",
+      "priority": "critical | high | medium | low"
+    }}
+  ],
+  "red_flags": ["<clause or term requiring immediate legal attention>"],
+  "top_asks": ["<the 3-5 highest-priority negotiation asks in order>"],
+  "favorable_terms": ["<terms that are already better than portfolio average, use as anchors>"]
+}}
+
+{target_block}
+
+{portfolio_block}
+
+Analyse every clause in the target contract. For clause types not present in the portfolio, still analyse the target's position in absolute terms and note the absence of benchmarks. Be specific — cite actual values and contract names from the portfolio.
+"""
 
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
@@ -652,6 +758,60 @@ def search_contracts(req: SearchRequest, db: Session = Depends(get_db)):
         return search_with_claude(req.question, contract_dicts)
     except Exception as e:
         raise HTTPException(500, f"Search failed: {e}")
+
+
+@app.get("/api/negotiations/{contract_id}")
+def get_negotiation(contract_id: int, db: Session = Depends(get_db)):
+    """Return cached analysis if portfolio hasn't changed, else return staleness flag."""
+    c = db.query(Contract).filter(Contract.id == contract_id, Contract.status == "completed").first()
+    if not c:
+        raise HTTPException(404, "Contract not found")
+    cached = db.query(NegotiationAnalysis).filter(NegotiationAnalysis.contract_id == contract_id).first()
+    if not cached:
+        return {"cached": False, "analysis": None, "stale": False}
+    current_hash = compute_portfolio_hash(db, exclude_id=contract_id)
+    stale = cached.portfolio_hash != current_hash
+    return {
+        "cached": True,
+        "stale": stale,
+        "created_at": cached.created_at.isoformat(),
+        "analysis": cached.analysis,
+    }
+
+
+@app.post("/api/negotiations/{contract_id}/analyze")
+def run_negotiation_analysis(contract_id: int, db: Session = Depends(get_db)):
+    """Run (or re-run) negotiation analysis for the given contract."""
+    target = db.query(Contract).filter(Contract.id == contract_id, Contract.status == "completed").first()
+    if not target:
+        raise HTTPException(404, "Contract not found or not yet processed")
+    portfolio = db.query(Contract).filter(
+        Contract.status == "completed",
+        Contract.id != contract_id
+    ).all()
+    if not portfolio:
+        raise HTTPException(400, "Need at least one other contract in portfolio to benchmark against")
+
+    target_dict    = contract_to_dict(target)
+    portfolio_dicts = [contract_to_dict(c) for c in portfolio]
+
+    try:
+        analysis = analyze_for_negotiations(target_dict, portfolio_dicts)
+    except Exception as e:
+        raise HTTPException(500, f"Analysis failed: {e}")
+
+    ph = compute_portfolio_hash(db, exclude_id=contract_id)
+
+    existing = db.query(NegotiationAnalysis).filter(NegotiationAnalysis.contract_id == contract_id).first()
+    if existing:
+        existing.analysis       = analysis
+        existing.portfolio_hash = ph
+        existing.created_at     = datetime.utcnow()
+    else:
+        db.add(NegotiationAnalysis(contract_id=contract_id, analysis=analysis, portfolio_hash=ph))
+    db.commit()
+
+    return {"cached": True, "stale": False, "created_at": datetime.utcnow().isoformat(), "analysis": analysis}
 
 
 @app.delete("/api/contracts/{contract_id}")

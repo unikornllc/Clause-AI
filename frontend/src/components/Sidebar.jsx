@@ -7,6 +7,7 @@ const NAV = [
   { id: 'search',      label: 'Ask Anything',      icon: '💬', section: 'Intelligence' },
   { id: 'risk',        label: 'Risk Map',          icon: '🔥', section: null },
   { id: 'obligations', label: 'Obligations',       icon: '✅', section: null },
+  { id: 'negotiate',   label: 'Negotiations',      icon: '🤝', section: null },
 ]
 
 const ROLE_LABELS = {

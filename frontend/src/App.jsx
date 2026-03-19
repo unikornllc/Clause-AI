@@ -7,13 +7,14 @@ import Search from './components/Search'
 import RiskMap from './components/RiskMap'
 import Obligations from './components/Obligations'
 import Executive from './components/Executive'
+import Negotiations from './components/Negotiations'
 import ContractLibrary from './components/ContractLibrary'
 import Login from './components/Login'
 import { api } from './api'
 
 const ROLE_VIEWS = {
-  legal:       ['dashboard', 'upload', 'library', 'brief', 'search', 'risk', 'obligations'],
-  procurement: ['dashboard', 'upload', 'library', 'brief', 'search', 'obligations'],
+  legal:       ['dashboard', 'upload', 'library', 'brief', 'search', 'risk', 'obligations', 'negotiate'],
+  procurement: ['dashboard', 'upload', 'library', 'brief', 'search', 'obligations', 'negotiate'],
   executive:   ['exec', 'dashboard', 'upload', 'library', 'brief', 'search', 'risk', 'obligations'],
 }
 
@@ -32,6 +33,7 @@ const TOPBAR = {
   risk:        ['Risk Map',           'Clause-level risk across your portfolio'],
   obligations: ['Obligations',        'What your contracts require you to do'],
   exec:        ['Executive Overview', 'Strategic portfolio summary'],
+  negotiate:   ['Negotiations Assistant', 'Clause-by-clause benchmarking for your next negotiation'],
 }
 
 // ── Hash helpers ──────────────────────────────────────────────
@@ -176,6 +178,7 @@ export default function App() {
         {view === 'library'     && <ContractLibrary navigate={navigate} />}
         {view === 'obligations' && <Obligations  navigate={navigate} />}
         {view === 'exec'        && <Executive    navigate={navigate} />}
+        {view === 'negotiate'    && <Negotiations  navigate={navigate} />}
       </div>
     </div>
   )
