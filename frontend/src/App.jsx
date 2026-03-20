@@ -12,10 +12,12 @@ import ContractLibrary from './components/ContractLibrary'
 import Login from './components/Login'
 import { api } from './api'
 
+const ALL_VIEWS = ['dashboard', 'exec', 'upload', 'library', 'brief', 'search', 'risk', 'obligations', 'negotiate']
+
 const ROLE_VIEWS = {
-  legal:       ['dashboard', 'upload', 'library', 'brief', 'search', 'risk', 'obligations', 'negotiate'],
-  procurement: ['dashboard', 'upload', 'library', 'brief', 'search', 'obligations', 'negotiate'],
-  executive:   ['exec', 'dashboard', 'upload', 'library', 'brief', 'search', 'risk', 'obligations'],
+  legal:       ALL_VIEWS,
+  procurement: ALL_VIEWS,
+  executive:   ALL_VIEWS,
 }
 
 const ROLE_HOME = {
