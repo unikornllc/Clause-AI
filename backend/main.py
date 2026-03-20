@@ -594,6 +594,17 @@ async def lifespan(app: FastAPI):
     try:
         if db.query(Contract).count() == 0:
             seed_database(db)
+        else:
+            # Remove duplicate contracts (same name, case-insensitive) keeping lowest id
+            from sqlalchemy import func
+            names = db.query(func.lower(Contract.name)).group_by(func.lower(Contract.name)).having(func.count() > 1).all()
+            for (name,) in names:
+                dupes = db.query(Contract).filter(func.lower(Contract.name) == name).order_by(Contract.id).all()
+                for c in dupes[1:]:  # keep first (seed), delete the rest
+                    db.query(RiskClause).filter(RiskClause.contract_id == c.id).delete()
+                    db.query(Obligation).filter(Obligation.contract_id == c.id).delete()
+                    db.delete(c)
+            db.commit()
         seed_users(db)
     finally:
         db.close()
