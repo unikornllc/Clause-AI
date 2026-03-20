@@ -224,7 +224,7 @@ Return exactly this structure:
   "auto_renewal": true or false,
   "auto_renewal_notice_days": number or null,
   "auto_renewal_term_years": number or null,
-  "total_value": number or null,
+  "total_value": number or null,   // ANNUAL value only. If the contract states a monthly fee, multiply by 12. If it states a multi-year total, divide by the number of years. Always return the per-year amount. Numbers only — no currency symbols.
   "currency": "USD" | "GBP" | "EUR" | "SAR" | "AED" | "KWD" | "QAR" | "OMR" | "BHD" | "EGP" | null,
   "governing_law": "jurisdiction string — in the contract's language",
   "plain_english_summary": "Write 2-3 paragraphs in the CONTRACT'S LANGUAGE: (1) what this contract does and key terms, (2) what is most concerning or risky, (3) what the reader should do now. Use **bold** for critical items. No legal jargon.",
