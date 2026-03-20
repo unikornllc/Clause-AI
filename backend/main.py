@@ -955,7 +955,7 @@ def get_stats(db: Session = Depends(get_db)):
 
     # Vendor spend
     vendor_spend = sorted(
-        [{"name": (c.parties or [c.name])[0], "value": c.total_value or 0, "id": c.id}
+        [{"name": (c.parties or [c.name])[-1], "value": c.total_value or 0, "id": c.id}
          for c in contracts if c.total_value],
         key=lambda x: x["value"], reverse=True
     )
